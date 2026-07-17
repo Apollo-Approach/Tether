@@ -1,0 +1,2 @@
+# E2E Test Runner Dependencies
+websockets>=14.2
