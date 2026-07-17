@@ -1,15 +1,15 @@
 const { execSync } = require('child_process');
 
 const patterns = [
-    'AKIA[0-9A-Z]{16}', // AWS Key
-    'sk-[a-zA-Z0-9]{48}', // OpenAI Key
-    'ghp_[a-zA-Z0-9]{36}', // GitHub Token
-    'xox[baprs]-[0-9]{12}-[0-9]{12}-[a-zA-Z0-9]{24}', // Slack Token
-    'AIza[0-9A-Za-z\\\\-_]{35}' // Google API Key
+    'AKIA[0-9A-Z]{16}',
+    'sk-[a-zA-Z0-9]{48}',
+    'ghp_[a-zA-Z0-9]{36}',
+    'xox[baprs]-[0-9]{12}-[0-9]{12}-[a-zA-Z0-9]{24}',
+    'AIza[0-9A-Za-z\\\\-_]{35}'
 ];
 
 try {
-    const diff = execSync('git diff --cached').toString();
+    const diff = execSync('git diff --cached', { maxBuffer: 1024 * 1024 * 50 }).toString();
     let found = false;
     for (const pattern of patterns) {
         const regex = new RegExp(pattern, 'g');
