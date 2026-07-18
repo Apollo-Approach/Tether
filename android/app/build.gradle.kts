@@ -71,13 +71,15 @@ dependencies {
   debugImplementation(libs.androidx.compose.ui.test.manifest)
 
   // Local tests: jUnit, coroutines, Android runner
-  testImplementation(libs.junit)
-  testImplementation(libs.kotlinx.coroutines.test)
+  testImplementation("junit:junit:4.13.2")
+  testImplementation("org.json:json:20230227")
+  testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
 
   // Instrumented tests: jUnit rules and runners
   androidTestImplementation(libs.androidx.test.core)
   androidTestImplementation(libs.androidx.test.ext.junit)
   androidTestImplementation(libs.androidx.test.runner)
+  androidTestImplementation("androidx.test:rules:1.6.1")
   androidTestImplementation(libs.androidx.test.espresso.core)
 
   // Navigation

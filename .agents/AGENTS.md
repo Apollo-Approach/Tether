@@ -20,3 +20,8 @@ Because this is the *only* way the user can see your plans and progress visually
 - When proposing large changes, draft them in artifacts so the user can review them on their device.
 
 Never skip the artifact planning phase if the task involves anything more than a trivial one-line fix. The user explicitly relies on artifacts as their primary feedback mechanism to understand what you are doing.
+
+## Process Management
+
+**Mandatory Agent Behavior:**
+The agent is **NOT ALLOWED** to start or run `receiver.exe` using terminal commands (e.g., `run_command`). The user manually manages the lifecycle and execution of the receiver process. If `receiver.exe` needs to be run, instruct the user to start it rather than attempting to launch it in the background yourself.

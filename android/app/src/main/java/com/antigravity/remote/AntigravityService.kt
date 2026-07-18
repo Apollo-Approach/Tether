@@ -25,6 +25,100 @@ class AntigravityService : Service() {
     companion object {
         const val ACTION_CONNECT = "com.antigravity.remote.CONNECT"
         const val EXTRA_URL = "url"
+
+        fun handleIncomingMessage(
+            text: String,
+            showMessageNotification: (String, String) -> Unit
+        ) {
+            try {
+                val json = JSONObject(text)
+                val type = json.optString("type")
+                if (type == "chat") {
+                    val role = json.optString("role", "user")
+                    val msg = json.optString("message", "")
+                    ConnectionRepository.addChatMessage(ChatMessage(role, msg))
+                    if (role == "assistant") {
+                        ConnectionRepository.setThinking(false)
+                        showMessageNotification("New Message", msg)
+                    }
+                } else if (type == "artifact") {
+                    val title = json.optString("title", "Artifact")
+                    val content = json.optString("content", "")
+                    val artifactMsg = ArtifactMessage(title, content)
+                    ConnectionRepository.setArtifact(artifactMsg)
+                    ConnectionRepository.addChatMessage(ChatMessage("assistant", "📝 **Artifact Updated:** $title\n\n$content"))
+                    showMessageNotification("Artifact Updated", title)
+                } else if (type == "handshake") {
+                    val dataObj = json.optJSONObject("data")
+                    if (dataObj != null) {
+                        val projectsArray = dataObj.optJSONArray("projects")
+                        if (projectsArray != null) {
+                            val projects = mutableListOf<String>()
+                            for (i in 0 until projectsArray.length()) {
+                                projects.add(projectsArray.getString(i))
+                            }
+                            ConnectionRepository.setProjects(projects)
+                        }
+                        val currentProject = dataObj.optString("current_project", "")
+                        if (currentProject.isNotEmpty()) {
+                            ConnectionRepository.setCurrentProject(currentProject)
+                        }
+                        val activeProject = dataObj.optString("activeProject", "")
+                        if (activeProject.isNotEmpty()) {
+                            ConnectionRepository.setCurrentProject(activeProject)
+                        }
+                        val activeConv = dataObj.optString("activeConversation", "")
+                        if (activeConv.isNotEmpty()) {
+                            ConnectionRepository.setActiveConversation(activeConv, "")
+                        }
+                    }
+                } else if (type == "approval_request") {
+                    val title = json.optString("title", "Permission Request")
+                    val optionsArray = json.optJSONArray("options")
+                    val optionsList = mutableListOf<String>()
+                    if (optionsArray != null) {
+                        for (i in 0 until optionsArray.length()) {
+                            optionsList.add(optionsArray.getString(i))
+                        }
+                    }
+                    ConnectionRepository.setApprovalRequest(ApprovalRequest(title, optionsList))
+                    ConnectionRepository.addChatMessage(ChatMessage("system", "[DEBUG] Received approval request: $title with ${optionsList.size} options"))
+                    showMessageNotification("Approval Needed", title)
+                } else if (type == "project_selected") {
+                    val project = json.optString("project", "")
+                    val conversationId = json.optString("conversationId", "")
+                    val firstMessage = json.optString("firstMessage", "")
+                    if (project.isNotEmpty()) {
+                        ConnectionRepository.setCurrentProject(project)
+                    }
+                    ConnectionRepository.setActiveConversation(conversationId, firstMessage)
+                    if (conversationId.isNotEmpty()) {
+                        ConnectionRepository.addChatMessage(ChatMessage("system", "\uD83D\uDD17 Connected to conversation: ${firstMessage.take(60)}..."))
+                    }
+                } else if (type == "conversations") {
+                    val dataArray = json.optJSONArray("data")
+                    if (dataArray != null) {
+                        val convos = mutableListOf<ConversationInfo>()
+                        for (i in 0 until dataArray.length()) {
+                            val c = dataArray.getJSONObject(i)
+                            convos.add(ConversationInfo(
+                                id = c.optString("id", ""),
+                                lastActive = c.optString("lastActive", ""),
+                                firstMessage = c.optString("firstMessage", "")
+                            ))
+                        }
+                        ConnectionRepository.setAvailableConversations(convos)
+                    }
+                } else if (type == "thought") {
+                    val textContent = json.optString("text", "")
+                    if (textContent.isNotEmpty()) {
+                        ConnectionRepository.appendThought(textContent)
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
     }
 
     private val CHANNEL_ID = "AntigravityServiceChannel"
@@ -166,56 +260,9 @@ class AntigravityService : Service() {
             }
             override fun onMessage(webSocket: WebSocket, text: String) {
                 scope.launch {
-                    try {
-                        val json = JSONObject(text)
-                        val type = json.optString("type")
-                        if (type == "chat") {
-                            val role = json.optString("role", "user")
-                            val msg = json.optString("message", "")
-                            ConnectionRepository.addChatMessage(ChatMessage(role, msg))
-                            if (role == "assistant") {
-                                ConnectionRepository.setThinking(false)
-                                showMessageNotification("New Message", msg)
-                            }
-                        } else if (type == "artifact") {
-                            val title = json.optString("title", "Artifact")
-                            val content = json.optString("content", "")
-                            val artifactMsg = ArtifactMessage(title, content)
-                            ConnectionRepository.setArtifact(artifactMsg)
-                            ConnectionRepository.addChatMessage(ChatMessage("assistant", "📝 **Artifact Updated:** $title\n\n$content"))
-                            showMessageNotification("Artifact Updated", title)
-                        } else if (type == "handshake") {
-                            val dataObj = json.optJSONObject("data")
-                            if (dataObj != null) {
-                                val projectsArray = dataObj.optJSONArray("projects")
-                                if (projectsArray != null) {
-                                    val projects = mutableListOf<String>()
-                                    for (i in 0 until projectsArray.length()) {
-                                        projects.add(projectsArray.getString(i))
-                                    }
-                                    ConnectionRepository.setProjects(projects)
-                                }
-                                val currentProject = dataObj.optString("current_project", "")
-                                if (currentProject.isNotEmpty()) {
-                                    ConnectionRepository.setCurrentProject(currentProject)
-                                }
-                            }
-                        } else if (type == "approval_request") {
-                            val title = json.optString("title", "Permission Request")
-                            val optionsArray = json.optJSONArray("options")
-                            val optionsList = mutableListOf<String>()
-                            if (optionsArray != null) {
-                                for (i in 0 until optionsArray.length()) {
-                                    optionsList.add(optionsArray.getString(i))
-                                }
-                            }
-                            ConnectionRepository.setApprovalRequest(ApprovalRequest(title, optionsList))
-                            ConnectionRepository.addChatMessage(ChatMessage("system", "[DEBUG] Received approval request: $title with ${optionsList.size} options"))
-                            showMessageNotification("Approval Needed", title)
+                        handleIncomingMessage(text) { title, msg ->
+                            showMessageNotification(title, msg)
                         }
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                    }
                 }
             }
         }

@@ -201,6 +201,8 @@ fun RemoteControlScreen() {
     
     var urlInput by remember { mutableStateOf("ws://10.10.10.10:8080") }
     var showMoreProjects by remember { mutableStateOf(false) }
+    var showNewProjectDialog by remember { mutableStateOf(false) }
+    var newProjectName by remember { mutableStateOf("") }
     var showSettingsDialog by remember { mutableStateOf(false) }
     val discoveredHosts = state.discoveredHosts
     
@@ -347,6 +349,61 @@ fun RemoteControlScreen() {
                 Text("Projects", modifier = Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.titleMedium)
                 HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
                 
+                NavigationDrawerItem(
+                    label = { Text("+ New Project") },
+                    selected = false,
+                    onClick = { 
+                        newProjectName = ""
+                        showNewProjectDialog = true 
+                        scope.launch { drawerState.close() }
+                    },
+                    modifier = Modifier.padding(horizontal = 12.dp),
+                    colors = NavigationDrawerItemDefaults.colors(
+                        unselectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                        unselectedTextColor = MaterialTheme.colorScheme.onPrimaryContainer
+                    )
+                )
+                
+                if (showNewProjectDialog) {
+                    AlertDialog(
+                        onDismissRequest = { showNewProjectDialog = false },
+                        title = { Text("Create Project") },
+                        text = {
+                            Column {
+                                Text("A new folder will be created in C:\\Development\\")
+                                Spacer(modifier = Modifier.height(8.dp))
+                                OutlinedTextField(
+                                    value = newProjectName,
+                                    onValueChange = { newProjectName = it },
+                                    label = { Text("Project Name") },
+                                    singleLine = true
+                                )
+                            }
+                        },
+                        confirmButton = {
+                            TextButton(
+                                onClick = { 
+                                    if (newProjectName.isNotBlank()) {
+                                        val payload = org.json.JSONObject().apply {
+                                            put("event", "create_project")
+                                            put("name", newProjectName.trim())
+                                        }
+                                        ConnectionRepository.webSocketManager?.send(payload.toString())
+                                        showNewProjectDialog = false 
+                                    }
+                                }
+                            ) {
+                                Text("Create")
+                            }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { showNewProjectDialog = false }) {
+                                Text("Cancel")
+                            }
+                        }
+                    )
+                }
+
                 val topProjects = allProjects.take(5)
                 val remainingProjects = allProjects.drop(5)
                 
@@ -359,6 +416,11 @@ fun RemoteControlScreen() {
                             selected = (proj == currentProject),
                             onClick = { 
                                 ConnectionRepository.setCurrentProject(proj)
+                                val payload = org.json.JSONObject().apply {
+                                    put("event", "select_project")
+                                    put("project", proj)
+                                }
+                                ConnectionRepository.webSocketManager?.send(payload.toString())
                                 scope.launch { drawerState.close() } 
                             },
                             modifier = Modifier.padding(horizontal = 12.dp)
@@ -380,6 +442,11 @@ fun RemoteControlScreen() {
                                     selected = (proj == currentProject),
                                     onClick = { 
                                         ConnectionRepository.setCurrentProject(proj)
+                                        val payload = org.json.JSONObject().apply {
+                                            put("event", "select_project")
+                                            put("project", proj)
+                                        }
+                                        ConnectionRepository.webSocketManager?.send(payload.toString())
                                         scope.launch { drawerState.close() } 
                                     },
                                     modifier = Modifier.padding(horizontal = 12.dp)
@@ -550,6 +617,49 @@ fun RemoteControlScreen() {
                         }
                     }
                     
+                    // Thinking UI
+                    if (isThinking) {
+                        val thinkingStartTime = ConnectionRepository.state.collectAsState().value.thinkingStartTime
+                        val currentThoughts = ConnectionRepository.state.collectAsState().value.currentThoughts
+                        var elapsedSeconds by remember { mutableStateOf(0L) }
+                        
+                        LaunchedEffect(thinkingStartTime) {
+                            if (thinkingStartTime != null) {
+                                while (true) {
+                                    elapsedSeconds = (System.currentTimeMillis() - thinkingStartTime) / 1000
+                                    delay(1000)
+                                }
+                            }
+                        }
+
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 8.dp)
+                        ) {
+                            Text(
+                                text = "Thinking... ${elapsedSeconds}s",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.padding(bottom = 4.dp)
+                            )
+                            if (currentThoughts.isNotEmpty()) {
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text(
+                                        text = currentThoughts,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.padding(8.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    
                     // Approval Request UI
                     AnimatedVisibility(
                         visible = currentApprovalRequest != null,
@@ -626,7 +736,7 @@ fun RemoteControlScreen() {
                                             put("message", chatInput)
                                             put("project", ConnectionRepository.state.value.currentProject)
                                         }
-                                        webSocketManager?.send(json.toString())
+                                        ConnectionRepository.webSocketManager?.send(json.toString())
                                         chatInput = ""
                                         ConnectionRepository.setThinking(true)
                                     }
@@ -642,7 +752,7 @@ fun RemoteControlScreen() {
                                         put("message", chatInput)
                                         put("project", ConnectionRepository.state.value.currentProject)
                                     }
-                                    webSocketManager?.send(json.toString())
+                                    ConnectionRepository.webSocketManager?.send(json.toString())
                                     chatInput = ""
                                     ConnectionRepository.setThinking(true)
                                 }
