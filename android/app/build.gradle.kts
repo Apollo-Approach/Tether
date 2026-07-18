@@ -45,7 +45,13 @@ kotlin {
 
 dependencies {
   implementation(files("libs/tsnet.aar"))
+  implementation(files("libs/sherpa-onnx-1.13.4.aar"))
   implementation(libs.okhttp)
+
+  // Security & Biometrics
+  implementation("androidx.biometric:biometric:1.2.0-alpha05")
+  implementation("androidx.security:security-crypto:1.1.0-alpha06")
+
   val composeBom = platform(libs.androidx.compose.bom)
   implementation(composeBom)
   androidTestImplementation(composeBom)

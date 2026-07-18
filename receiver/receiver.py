@@ -53,13 +53,17 @@ PROJECTS_DIR = os.path.expanduser(r"~/.gemini/config/projects")
 SCAN_DEPTH = 100  # How many recent conversations to check
 TRANSCRIPT_SCAN_LINES = 30  # Lines to read per transcript for workspace matching
 
-# ─── Global State ───
+
+# --- Global State ---
 active_conversation_id = None
 active_project_name = None
 tailer_task = None
 _tailer_cancel = None
 connected_clients = set()
 _cdp_port = None  # Discovered Antigravity DevTools port
+
+# --- Security ---
+# Relying on Tailscale network for transport security and Android Biometrics for user authentication.
 
 
 # ─── CDP (Chrome DevTools Protocol) ───
@@ -538,6 +542,14 @@ async def handle_client(websocket, *args, mock=False, **kwargs):
     """Handles incoming WebSocket connections and processes JSON control messages."""
     global active_conversation_id, active_project_name
 
+    # Auto-approve connection since Tailscale provides transport security
+    try:
+        await websocket.send(json.dumps({"type": "auth_success"}))
+    except Exception as e:
+        print(f"Auth error: {e}", file=sys.stderr)
+        await websocket.close(1008, "Auth error")
+        return
+
     connected_clients.add(websocket)
 
     try:
@@ -816,7 +828,7 @@ async def main():
         try:
             local_ips = [
                 ip for ip in socket.gethostbyname_ex(hostname)[2]
-                if not ip.startswith("127.")
+                if not ip.startswith("127.") and not ip.startswith("169.254.")
             ]
             if not local_ips:
                 local_ips = ['127.0.0.1']

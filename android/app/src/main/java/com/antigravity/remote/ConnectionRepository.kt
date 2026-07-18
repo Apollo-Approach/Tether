@@ -28,6 +28,7 @@ data class AppState(
 
 object ConnectionRepository {
     var webSocketManager: WebSocketManager? = null
+    var ttsManager: TTSManager? = null
     private val _state = MutableStateFlow(AppState())
     val state: StateFlow<AppState> = _state.asStateFlow()
 

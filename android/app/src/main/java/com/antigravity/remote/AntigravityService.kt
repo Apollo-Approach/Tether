@@ -28,7 +28,8 @@ class AntigravityService : Service() {
 
         fun handleIncomingMessage(
             text: String,
-            showMessageNotification: (String, String) -> Unit
+            showMessageNotification: (String, String) -> Unit,
+            onAssistantChat: (String) -> Unit = {}
         ) {
             try {
                 val json = JSONObject(text)
@@ -40,6 +41,7 @@ class AntigravityService : Service() {
                     if (role == "assistant") {
                         ConnectionRepository.setThinking(false)
                         showMessageNotification("New Message", msg)
+                        onAssistantChat(msg)
                     }
                 } else if (type == "artifact") {
                     val title = json.optString("title", "Artifact")
@@ -128,10 +130,37 @@ class AntigravityService : Service() {
     private var discoveryListener: NsdManager.DiscoveryListener? = null
     private val webSocketManager = WebSocketManager()
     
+    private var ttsManager: TTSManager? = null
+    private var audioMediaManager: AudioFocusAndMediaManager? = null
+    private var voiceManager: VoiceRecognizerManager? = null
+
     override fun onCreate() {
         super.onCreate()
         createNotificationChannels()
         ConnectionRepository.webSocketManager = webSocketManager
+        
+        ttsManager = TTSManager(this) {
+            // TTS finished reading, start listening
+            audioMediaManager?.abandonAudioFocus()
+            voiceManager?.startListening()
+        }
+        ConnectionRepository.ttsManager = ttsManager
+        
+        audioMediaManager = AudioFocusAndMediaManager(this) {
+            ttsManager?.togglePause()
+        }
+        
+        voiceManager = VoiceRecognizerManager(this, onResult = { text ->
+            val payload = JSONObject().apply {
+                put("event", "chat")
+                put("message", text)
+            }
+            webSocketManager.send(payload.toString())
+            audioMediaManager?.abandonAudioFocus()
+        }, onError = { error ->
+            android.util.Log.e("AntigravityService", "Voice error: $error")
+            audioMediaManager?.abandonAudioFocus()
+        })
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -147,7 +176,9 @@ class AntigravityService : Service() {
             .setContentIntent(pendingIntent)
             .build()
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         } else {
             startForeground(1, notification)
@@ -155,10 +186,9 @@ class AntigravityService : Service() {
 
         if (intent?.action == ACTION_CONNECT) {
             val url = intent.getStringExtra(EXTRA_URL)
-            val useProxy = intent.getBooleanExtra("useProxy", false)
             if (url != null) {
                 stopDiscovery()
-                connectWebSocket(url, useProxy)
+                connectWebSocket(url)
             }
             return START_STICKY
         }
@@ -228,45 +258,50 @@ class AntigravityService : Service() {
         discoveryListener = null
     }
 
-    private fun connectWebSocket(url: String, useProxy: Boolean = false) {
-        var finalUrl = url
-        var passTailscaleProxyFlag = useProxy
-        
-        if (useProxy) {
-            try {
-                val uri = java.net.URI(url)
-                val targetHostPort = "${uri.host}:${if (uri.port == -1) 80 else uri.port}"
-                tsnet_wrapper.Tsnet_wrapper.setProxyTarget(targetHostPort)
-                finalUrl = url.replace(targetHostPort, "127.0.0.1:1080")
-                passTailscaleProxyFlag = false
-                android.util.Log.e("AntigravityClick", "TCP Proxy target set to: $targetHostPort, finalUrl: $finalUrl")
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-        }
-
+    private fun connectWebSocket(url: String) {
         val listener = object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                ConnectionRepository.updateConnectionStatus("Connected")
-                updateForegroundNotification("Connected to Antigravity")
+                if (webSocketManager.isCurrentWebSocket(webSocket)) {
+                    ConnectionRepository.updateConnectionStatus("Authenticating...")
+                }
             }
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                ConnectionRepository.updateConnectionStatus("Disconnected")
-                updateForegroundNotification("Disconnected")
+                if (webSocketManager.isCurrentWebSocket(webSocket)) {
+                    ConnectionRepository.updateConnectionStatus("Disconnected")
+                    updateForegroundNotification("Disconnected")
+                }
             }
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                ConnectionRepository.updateConnectionStatus("Error: ${t.message}")
-                updateForegroundNotification("Connection Error")
+                if (webSocketManager.isCurrentWebSocket(webSocket)) {
+                    ConnectionRepository.updateConnectionStatus("Error: ${t.message}")
+                    updateForegroundNotification("Connection Error")
+                }
             }
             override fun onMessage(webSocket: WebSocket, text: String) {
+                try {
+                    val json = org.json.JSONObject(text)
+                    if (json.optString("type") == "auth_success") {
+                        ConnectionRepository.updateConnectionStatus("Connected")
+                        updateForegroundNotification("Connected to Antigravity")
+                        return
+                    }
+                } catch(e: Exception) {}
+                
                 scope.launch {
-                        handleIncomingMessage(text) { title, msg ->
-                            showMessageNotification(title, msg)
-                        }
+                        handleIncomingMessage(text, 
+                            showMessageNotification = { title, msg ->
+                                showMessageNotification(title, msg)
+                            },
+                            onAssistantChat = { msg ->
+                                if (audioMediaManager?.requestAudioFocus() == true) {
+                                    ttsManager?.speak(msg)
+                                }
+                            }
+                        )
                 }
             }
         }
-        webSocketManager.connect(finalUrl, listener, passTailscaleProxyFlag)
+        webSocketManager.connect(url, listener)
     }
 
     private fun updateForegroundNotification(text: String) {
@@ -308,6 +343,9 @@ class AntigravityService : Service() {
             try { nsdManager.stopServiceDiscovery(it) } catch (e: Exception) {}
         }
         webSocketManager.disconnect()
+        ttsManager?.release()
+        audioMediaManager?.destroy()
+        voiceManager?.destroy()
         super.onDestroy()
     }
 

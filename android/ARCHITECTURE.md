@@ -20,7 +20,14 @@ Network Service Discovery (NSD) is heavily utilized to automatically find and co
 - **Service-Level Discovery**: Inside `AntigravityService`, an `NsdManager.DiscoveryListener` is started to look for services broadcasting via `_adb-tls-connect._tcp`. When a service containing `"adb-tls-connect"` in its name is resolved, the service retrieves the host IP and port, constructs the WebSocket URL (`ws://<ip>:<port>`), and automatically establishes a connection without user intervention.
 - **UI-Level Discovery (`NsdDiscoveryManager`)**: In `MainActivity.kt`, there is a dedicated `NsdDiscoveryManager` class that listens for `_antigravity._tcp.` (or `_antigravity._tcp.local.`) services. Discovered hosts are emitted via a `StateFlow` and presented to the user in a Navigation Drawer, allowing them to manually select from multiple available Antigravity hosts on the network.
 
-## 3. State Management (`ConnectionRepository`)
+## 3. Tailscale Embedded Proxy (`tsnet_wrapper.go`)
+
+The app includes an embedded Tailscale node via `tsnet`.
+- **Remote Access (Available PCs)**: When a user selects a Tailscale peer from the Navigation Drawer, the `AntigravityService` receives an intent with `useProxy = true` and target URL containing the Tailscale IP on port `8765`.
+- **Port 8765 vs 8080**: The `tsnet_proxy.exe` on the host PC purposefully exposes port `8765` over the Tailscale network and internally proxies it to local port `8080` (where `receiver.py` actually listens). Therefore, Android clients must always target `8765` when connecting via Tailscale, but target `8080` when connecting via local mDNS.
+- **Local TCP Proxy (`1080`)**: To route OkHttp WebSocket traffic over the embedded Tailscale node, `tsnet_wrapper` spins up a local raw TCP proxy on `127.0.0.1:1080`. OkHttp connects to this local port, and the Go code pipes the traffic to the specified Tailscale IP on port `8765`.
+
+## 4. State Management (`ConnectionRepository`)
 
 The application acts as a reactive system using Kotlin Coroutines and StateFlows, orchestrated through a singleton `ConnectionRepository`.
 

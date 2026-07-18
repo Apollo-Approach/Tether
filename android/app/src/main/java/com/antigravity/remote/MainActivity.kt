@@ -49,6 +49,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.foundation.Canvas
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.graphics.Brush
@@ -146,15 +147,19 @@ class NsdDiscoveryManager(context: Context) {
     }
 }
 
-class MainActivity : ComponentActivity() {
+class MainActivity : androidx.fragment.app.FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        SecurityManager.init(this)
 
-        // Request notification permission on Android 13+
+        // Request notification and mic permission
+        val permissions = mutableListOf(Manifest.permission.RECORD_AUDIO)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 101)
-            }
+            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        val ungranted = permissions.filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
+        if (ungranted.isNotEmpty()) {
+            requestPermissions(ungranted.toTypedArray(), 101)
         }
 
         // Start the background service
@@ -172,12 +177,45 @@ class MainActivity : ComponentActivity() {
         // TailscaleManager.start(this)
 
         setContent {
+            var showBiometricPrompt by remember { mutableStateOf(SecurityManager.requiresBiometricAuth()) }
+
+            if (showBiometricPrompt) {
+                LaunchedEffect(Unit) {
+                    val executor = androidx.core.content.ContextCompat.getMainExecutor(this@MainActivity)
+                    val biometricPrompt = androidx.biometric.BiometricPrompt(this@MainActivity, executor,
+                        object : androidx.biometric.BiometricPrompt.AuthenticationCallback() {
+                            override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                                super.onAuthenticationError(errorCode, errString)
+                                // If they cancel or fail, maybe finish the app
+                                if (errorCode == androidx.biometric.BiometricPrompt.ERROR_NEGATIVE_BUTTON || errorCode == androidx.biometric.BiometricPrompt.ERROR_USER_CANCELED) {
+                                    finish()
+                                }
+                            }
+
+                            override fun onAuthenticationSucceeded(result: androidx.biometric.BiometricPrompt.AuthenticationResult) {
+                                super.onAuthenticationSucceeded(result)
+                                SecurityManager.markAuthenticated()
+                                showBiometricPrompt = false
+                            }
+                        })
+                    val promptInfo = androidx.biometric.BiometricPrompt.PromptInfo.Builder()
+                        .setTitle("Authentication required")
+                        .setSubtitle("Log in using your biometric credential")
+                        .setNegativeButtonText("Cancel")
+                        .build()
+
+                    biometricPrompt.authenticate(promptInfo)
+                }
+            }
+
             MaterialTheme {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    RemoteControlScreen()
+                    if (!showBiometricPrompt) {
+                        RemoteControlScreen()
+                    }
                 }
             }
         }
@@ -207,7 +245,8 @@ fun RemoteControlScreen() {
     val discoveredHosts = state.discoveredHosts
     
     var isTrackpadVisible by remember { mutableStateOf(false) }
-    var chatInput by remember { mutableStateOf("") }
+    var showVoiceSettings by remember { mutableStateOf(false) }
+    var chatInput by remember { mutableStateOf(TextFieldValue("")) }
     val context = LocalContext.current
     
     val photoPickerLauncher = rememberLauncherForActivityResult(
@@ -274,7 +313,7 @@ fun RemoteControlScreen() {
                 
                 HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
 
-                Text("Available Hosts", modifier = Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.titleMedium)
+                Text("Local Connection (Wi-Fi)", modifier = Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.titleMedium)
                 if (discoveredHosts.isEmpty()) {
                     Text("Scanning for hosts...", modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.bodyMedium, color = Color.Gray)
                 } else {
@@ -298,22 +337,24 @@ fun RemoteControlScreen() {
                     }
                 }
                 
-                Spacer(modifier = Modifier.weight(1f))
-                
                 val peers by TailscaleManager.peers.collectAsState()
                 if (peers.isNotEmpty()) {
-                    Text("Available PCs", modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.titleSmall)
+                    Text("Remote Connection (Tailscale)", modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.titleSmall)
+                    val disableTailscalePeers = discoveredHosts.isNotEmpty() && connectionStatus == "Connected"
                     peers.filter { it.online }.forEach { peer ->
                         NavigationDrawerItem(
                             label = { 
                                 Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Box(modifier = Modifier.size(8.dp).background(Color.Green, shape = androidx.compose.foundation.shape.CircleShape))
+                                    val indicatorColor = if (disableTailscalePeers) Color.Gray else Color.Green
+                                    val textColor = if (disableTailscalePeers) Color.Gray else Color.Unspecified
+                                    Box(modifier = Modifier.size(8.dp).background(indicatorColor, shape = androidx.compose.foundation.shape.CircleShape))
                                     Spacer(modifier = Modifier.width(8.dp))
-                                    Text(peer.hostname)
+                                    Text(peer.hostname, color = textColor)
                                 }
                             },
                             selected = false,
                             onClick = {
+                                if (disableTailscalePeers) return@NavigationDrawerItem
                                 try {
                                     android.util.Log.e("AntigravityClick", "Clicked peer: ${peer.hostname}, IP: ${peer.ip}")
                                     if (connectionStatus == "Connected") {
@@ -326,7 +367,6 @@ fun RemoteControlScreen() {
                                     val intent = Intent(context, AntigravityService::class.java).apply {
                                         action = "com.antigravity.remote.CONNECT"
                                         putExtra("url", "ws://$targetHost:8765")
-                                        putExtra("useProxy", true)
                                     }
                                     androidx.core.content.ContextCompat.startForegroundService(context, intent)
                                     android.util.Log.e("AntigravityClick", "Started service, closing drawer...")
@@ -505,7 +545,7 @@ fun RemoteControlScreen() {
                 TopAppBar(
                     title = { 
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text("Antigravity")
+                            Text("Antigravity ($connectionStatus)", style = MaterialTheme.typography.bodySmall)
                             Spacer(modifier = Modifier.width(8.dp))
                             val indicatorColor = when (connectionStatus) {
                                 "Connected" -> Color.Green
@@ -521,6 +561,9 @@ fun RemoteControlScreen() {
                         }
                     },
                     actions = {
+                        IconButton(onClick = { showVoiceSettings = true }) {
+                            Icon(Icons.Default.Settings, contentDescription = "Settings")
+                        }
                         IconButton(onClick = { isTrackpadVisible = true }) {
                             Icon(Icons.Default.Edit, contentDescription = "Trackpad")
                         }
@@ -529,6 +572,11 @@ fun RemoteControlScreen() {
             }
         ) { padding ->
             Box(modifier = Modifier.padding(padding).fillMaxSize()) {
+                AnimatedWireframeBackground(modifier = Modifier.fillMaxSize())
+                
+                if (showVoiceSettings) {
+                    VoiceSettingsBottomSheet(onDismiss = { showVoiceSettings = false })
+                }
                 val infiniteTransition = rememberInfiniteTransition()
                 val color1 by infiniteTransition.animateColor(
                     initialValue = Color(0xFF00FFAA),
@@ -578,25 +626,46 @@ fun RemoteControlScreen() {
                 )
                 
                 if (showSettingsDialog) {
+                    var biometricsEnabled by remember { mutableStateOf(SecurityManager.isBiometricsEnabled) }
                     AlertDialog(
                         onDismissRequest = { showSettingsDialog = false },
                         title = { Text("Settings") },
-                        text = { Text("Settings configuration coming soon.") },
+                        text = {
+                            Column {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text("Require Biometrics")
+                                    Switch(
+                                        checked = biometricsEnabled,
+                                        onCheckedChange = { 
+                                            biometricsEnabled = it
+                                            SecurityManager.isBiometricsEnabled = it
+                                        }
+                                    )
+                                }
+                            }
+                        },
                         confirmButton = {
                             TextButton(onClick = { showSettingsDialog = false }) {
-                                Text("OK")
+                                Text("Close")
                             }
                         }
                     )
                 }
                 
                 // Main Chat Area
+                val listState = androidx.compose.foundation.lazy.rememberLazyListState()
+                
                 Column(modifier = Modifier.fillMaxSize()) {
                     LazyColumn(
+                        state = listState,
                         modifier = Modifier.weight(1f).padding(8.dp),
-                        reverseLayout = false
+                        reverseLayout = true
                     ) {
-                        items(chatMessages) { msg ->
+                        items(chatMessages.asReversed()) { msg ->
                             val isUser = msg.role == "user"
                             Row(
                                 modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
@@ -730,14 +799,14 @@ fun RemoteControlScreen() {
                             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                             keyboardActions = KeyboardActions(
                                 onSend = {
-                                    if (chatInput.isNotBlank() && connectionStatus == "Connected") {
+                                    if (chatInput.text.isNotBlank() && connectionStatus == "Connected") {
                                         val json = JSONObject().apply {
                                             put("event", "chat")
-                                            put("message", chatInput)
+                                            put("message", chatInput.text)
                                             put("project", ConnectionRepository.state.value.currentProject)
                                         }
                                         ConnectionRepository.webSocketManager?.send(json.toString())
-                                        chatInput = ""
+                                        chatInput = TextFieldValue("")
                                         ConnectionRepository.setThinking(true)
                                     }
                                 }
@@ -746,14 +815,14 @@ fun RemoteControlScreen() {
                         Spacer(modifier = Modifier.width(8.dp))
                         IconButton(
                             onClick = {
-                                if (chatInput.isNotBlank() && connectionStatus == "Connected") {
+                                if (chatInput.text.isNotBlank() && connectionStatus == "Connected") {
                                     val json = JSONObject().apply {
                                         put("event", "chat")
-                                        put("message", chatInput)
+                                        put("message", chatInput.text)
                                         put("project", ConnectionRepository.state.value.currentProject)
                                     }
                                     ConnectionRepository.webSocketManager?.send(json.toString())
-                                    chatInput = ""
+                                    chatInput = TextFieldValue("")
                                     ConnectionRepository.setThinking(true)
                                 }
                             },
@@ -924,22 +993,29 @@ class WebSocketManager {
     private var webSocket: WebSocket? = null
     private var client: OkHttpClient = OkHttpClient()
 
-    fun connect(url: String, listener: WebSocketListener, useTailscaleProxy: Boolean = false) {
+    fun connect(url: String, listener: WebSocketListener) {
         disconnect()
         
         val builder = OkHttpClient.Builder()
             .connectTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
             .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
             .writeTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+            .pingInterval(15, java.util.concurrent.TimeUnit.SECONDS)
 
-        client = if (useTailscaleProxy) {
-            builder.proxy(Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", 1080)))
-                .build()
-        } else {
-            builder.build()
+        var finalUrl = url
+        if (url.contains(":8765") || url.contains("100.")) {
+            try {
+                val hostPort = url.substringAfter("://").substringBefore("/")
+                tsnet_wrapper.Tsnet_wrapper.setProxyTarget(hostPort)
+                finalUrl = url.replace(hostPort, "127.0.0.1:1080")
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
         }
+
+        client = builder.build()
         
-        val request = Request.Builder().url(url).build()
+        val request = Request.Builder().url(finalUrl).build()
         webSocket = client.newWebSocket(request, listener)
     }
 
@@ -948,7 +1024,229 @@ class WebSocketManager {
         webSocket = null
     }
 
+    fun isCurrentWebSocket(ws: WebSocket): Boolean {
+        return webSocket == ws
+    }
+
     fun send(message: String): Boolean {
         return webSocket?.send(message) ?: false
     }
 }
+
+// --- Added for Animated Wireframe Background and Voice Settings ---
+
+data class Node(val relativeX: Float, val relativeY: Float, val icon: androidx.compose.ui.graphics.vector.ImageVector)
+data class Edge(val start: Node, val end: Node)
+data class Packet(val edge: Edge, val phaseOffset: Float)
+
+@Composable
+fun AnimatedWireframeBackground(modifier: Modifier = Modifier) {
+    val nodes = remember {
+        listOf(
+            Node(0.1f, 0.2f, Icons.Default.Phone), 
+            Node(0.8f, 0.1f, Icons.Default.Computer),
+            Node(0.3f, 0.5f, Icons.Default.Router), 
+            Node(0.9f, 0.6f, Icons.Default.Cloud),
+            Node(0.2f, 0.8f, Icons.Default.Face), 
+            Node(0.7f, 0.9f, Icons.Default.Storage)
+        )
+    }
+    
+    val edges = remember(nodes) {
+        listOf(
+            Edge(nodes[0], nodes[2]), Edge(nodes[2], nodes[4]),
+            Edge(nodes[1], nodes[3]), Edge(nodes[3], nodes[5]),
+            Edge(nodes[0], nodes[1]), Edge(nodes[2], nodes[3]),
+            Edge(nodes[4], nodes[5])
+        )
+    }
+
+    val packets = remember(edges) {
+        edges.flatMap { edge ->
+            listOf(
+                Packet(edge, phaseOffset = 0.0f),
+                Packet(edge, phaseOffset = 0.5f)
+            )
+        }
+    }
+
+    val infiniteTransition = androidx.compose.animation.core.rememberInfiniteTransition()
+    
+    val globalPhase by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = androidx.compose.animation.core.infiniteRepeatable(
+            animation = androidx.compose.animation.core.tween(durationMillis = 6000, easing = androidx.compose.animation.core.LinearEasing),
+            repeatMode = androidx.compose.animation.core.RepeatMode.Restart
+        )
+    )
+
+    androidx.compose.foundation.layout.BoxWithConstraints(modifier = modifier.fillMaxSize()) {
+        val w = maxWidth
+        val h = maxHeight
+        val density = androidx.compose.ui.platform.LocalDensity.current
+        val wPx = with(density) { w.toPx() }
+        val hPx = with(density) { h.toPx() }
+
+        val wireColor = Color.Gray.copy(alpha = 0.15f)
+        val packetColor = Color.Cyan.copy(alpha = 0.35f)
+
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            edges.forEach { edge ->
+                drawLine(
+                    color = wireColor,
+                    start = Offset(edge.start.relativeX * wPx, edge.start.relativeY * hPx),
+                    end = Offset(edge.end.relativeX * wPx, edge.end.relativeY * hPx),
+                    strokeWidth = 6f,
+                    cap = androidx.compose.ui.graphics.StrokeCap.Round
+                )
+            }
+
+            packets.forEach { packet ->
+                val currentProgress = (globalPhase + packet.phaseOffset) % 1.0f
+                val startX = packet.edge.start.relativeX * wPx
+                val startY = packet.edge.start.relativeY * hPx
+                val endX = packet.edge.end.relativeX * wPx
+                val endY = packet.edge.end.relativeY * hPx
+                
+                val currentX = startX + (endX - startX) * currentProgress
+                val currentY = startY + (endY - startY) * currentProgress
+
+                drawCircle(
+                    color = packetColor,
+                    radius = 14f,
+                    center = Offset(currentX, currentY)
+                )
+            }
+        }
+        
+        nodes.forEach { node ->
+            Icon(
+                imageVector = node.icon,
+                contentDescription = null,
+                tint = wireColor,
+                modifier = Modifier
+                    .offset(
+                        x = w * node.relativeX - 12.dp,
+                        y = h * node.relativeY - 12.dp
+                    )
+                    .size(24.dp)
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun VoiceSettingsBottomSheet(
+    onDismiss: () -> Unit
+) {
+    val sheetState = rememberModalBottomSheetState()
+    
+    // Kokoro usually has voices mapped to indices 0-10 or similar
+    // We will just provide a simple list of SIDs.
+    val availableSids = (0..10).toList()
+    var expanded by remember { mutableStateOf(false) }
+    var selectedSid by remember { mutableStateOf(0) }
+    var previewText by remember { mutableStateOf(TextFieldValue("This is a preview of my voice.")) }
+    var showRestartDialog by remember { mutableStateOf(false) }
+    
+    val ttsManager = ConnectionRepository.ttsManager
+    val context = androidx.compose.ui.platform.LocalContext.current
+
+    if (showRestartDialog) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { showRestartDialog = false },
+            title = { Text("Restart App") },
+            text = { Text("Are you sure you want to fully restart the app?") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val intent = context.packageManager.getLaunchIntentForPackage(context.packageName)
+                        val componentName = intent?.component
+                        val mainIntent = android.content.Intent.makeRestartActivityTask(componentName)
+                        context.startActivity(mainIntent)
+                        Runtime.getRuntime().exit(0)
+                    }
+                ) {
+                    Text("Restart")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showRestartDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text("Voice Settings", style = MaterialTheme.typography.titleLarge)
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            // Dropdown for Voice SID
+            ExposedDropdownMenuBox(
+                expanded = expanded,
+                onExpandedChange = { expanded = !expanded }
+            ) {
+                OutlinedTextField(
+                    value = "Voice ID: $selectedSid",
+                    onValueChange = {},
+                    readOnly = true,
+                    label = { Text("Selected Voice") },
+                    trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+                    modifier = Modifier.menuAnchor()
+                )
+                ExposedDropdownMenu(
+                    expanded = expanded,
+                    onDismissRequest = { expanded = false }
+                ) {
+                    availableSids.forEach { sid ->
+                        DropdownMenuItem(
+                            text = { Text("Voice ID: $sid") },
+                            onClick = {
+                                selectedSid = sid
+                                ttsManager?.setVoice(sid)
+                                expanded = false
+                            }
+                        )
+                    }
+                }
+            }
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            OutlinedTextField(
+                value = previewText,
+                onValueChange = { previewText = it },
+                label = { Text("Preview Text") },
+                modifier = Modifier.fillMaxWidth()
+            )
+            
+            Spacer(modifier = Modifier.height(24.dp))
+            
+            Button(
+                onClick = { 
+                    ttsManager?.speak(previewText.text)
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Default.PlayArrow, contentDescription = "Play")
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Play Preview")
+            }
+            
+            Spacer(modifier = Modifier.height(32.dp))
+        }
+    }
+}
+

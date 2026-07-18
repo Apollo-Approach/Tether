@@ -19,6 +19,10 @@ The receiver leverages the `websockets` library to spin up an async server (defa
 - **Client Handling**: The server maintains a set of connected clients and broadcasts data to them (like agent chat messages and artifacts). It also listens for incoming control commands formatted as JSON payloads.
 - **Project Listing**: When a client connects, the server automatically sends a list of available projects found in the `~/.gemini/config/projects` directory.
 
+### Tailscale Proxy Integration
+The PC receiver also runs `tsnet_proxy.exe` alongside the WebSocket server to handle remote connections over Tailscale (for cellular handoff). 
+- **CRITICAL**: `tsnet_proxy.exe` is hardcoded to listen on port **`8765`** on the Tailnet interface, while the primary `receiver.py` local Wi-Fi connection uses port **`8080`**. Ensure client applications connect to the correct ports depending on the connection medium (Tailscale vs Local Wi-Fi).
+
 ---
 
 ## 2. Artifact Tailing Mechanism
