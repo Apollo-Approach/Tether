@@ -51,3 +51,25 @@ The user interface is built entirely using Jetpack Compose in `MainActivity.kt`.
   - **Navigation Drawer (`ModalNavigationDrawer`)**: Displays the list of discovered hosts from the `NsdDiscoveryManager` for manual connection selection.
   - **Chat Interface & Visual Inputs**: Includes tools for sending text and visual media. An `ActivityResultContracts.PickVisualMedia` launcher is used to let users select photos, scale them down, convert them to Base64, and transmit them via the active WebSocket connection.
   - **Artifact & Approval Modals**: (Inferred from state usage) The Compose UI reacts to non-null `currentArtifact` or `currentApprovalRequest` state values by likely rendering overlay dialogues or dedicated views to let the user review plans or grant execution permissions on the go.
+
+## 5. UI Theming & Design System
+
+The application employs a custom Material 3 design system to achieve a premium, dark-mode aesthetic (the "Amber" theme) that mirrors the Antigravity desktop experience.
+
+- **Theme Layer (`Theme.kt`)**: Replaces the default Material 3 color scheme with a custom `darkColorScheme`. It also automatically configures the Android system bars (status bar and navigation bar) to match the dark background, providing a seamless edge-to-edge look.
+- **Color Palette (`Color.kt`)**: Defines a highly specific set of semantic colors:
+  - **Backgrounds**: Deep navy-blacks (`DarkBackground`, `DarkSurface`).
+  - **Accents**: Warm Amber/Gold (`Amber`) as the primary accent, supported by `AccentBlue` and `AccentPurple`.
+  - **Containers**: Asymmetric chat bubbles use distinct container colors (`UserBubble` vs `AssistantBubble`) to clearly separate user inputs from agent responses.
+- **Typography (`Type.kt`)**: Refines the standard Material typography scales. It enforces specific letter spacing, weights, and introduces monospace styling (`labelMedium`) specifically for rendering code blocks and timers.
+
+## 6. Custom UI Components
+
+- **Markdown Rendering (`MarkdownText.kt`)**: A lightweight, zero-dependency Markdown parsing engine built specifically for Jetpack Compose. It interprets agent responses (which are often rich text) and renders:
+  - Headers (with automatic horizontal dividers for H1/H2).
+  - Inline formatting (Bold, Italic, Links).
+  - Lists (Bullet and Numbered).
+  - Blockquotes (with a purple accent bar).
+  - Code blocks (styled with monospace font and a distinct elevated background).
+- **Artifact Panel**: A dedicated, sliding side-panel (85-92% width) that renders Markdown documents (artifacts) sent by the agent. It provides a focused reading environment for large plans or code files without navigating away from the chat context.
+- **Thinking Indicator**: A custom animated component featuring bouncing amber dots (using infinite transition animations) and a live timer, providing immediate visual feedback while the agent is processing a request.

@@ -5,10 +5,10 @@ plugins {
 }
 
 android {
-    namespace = "com.antigravity.remote"
+    namespace = "com.rover.remote"
     compileSdk = 36
     defaultConfig {
-        applicationId = "com.antigravity.remote"
+        applicationId = "com.rover.remote"
         minSdk = 36
         targetSdk = 36
         versionCode = 1
@@ -51,6 +51,9 @@ dependencies {
   // Security & Biometrics
   implementation("androidx.biometric:biometric:1.2.0-alpha05")
   implementation("androidx.security:security-crypto:1.1.0-alpha06")
+
+  // Media (MediaStyle notifications)
+  implementation("androidx.media:media:1.7.0")
 
   val composeBom = platform(libs.androidx.compose.bom)
   implementation(composeBom)

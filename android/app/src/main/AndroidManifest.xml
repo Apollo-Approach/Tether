@@ -8,6 +8,7 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
 
     <queries>
         <intent>
@@ -23,7 +24,7 @@
         android:supportsRtl="true"
         android:windowSoftInputMode="adjustResize"
         android:usesCleartextTraffic="true"
-        android:theme="@style/Theme.Antigravity">
+        android:theme="@style/Theme.Rover">
         <activity
             android:name=".MainActivity"
             android:exported="true">
@@ -33,7 +34,17 @@
             </intent-filter>
         </activity>
 
-        <service android:name=".AntigravityService" android:foregroundServiceType="dataSync|microphone" />
+        <service android:name=".RoverService" android:foregroundServiceType="dataSync|microphone" />
+
+        <receiver android:name=".MediaButtonReceiver" android:exported="false">
+            <intent-filter>
+                <action android:name="ACTION_PLAY" />
+                <action android:name="ACTION_PAUSE" />
+                <action android:name="ACTION_STOP" />
+                <action android:name="ACTION_PLAY_PAUSE" />
+            </intent-filter>
+        </receiver>
     </application>
 
 </manifest>
+
