@@ -24,6 +24,7 @@ class WebSocketServer:
         
         self.tailer_task = None
         self._tailer_cancel = None
+        self.queue_monitor_task = None
 
     async def broadcast(self, msg_dict):
         """Send a message to all connected WebSocket clients."""
@@ -182,8 +183,22 @@ class WebSocketServer:
         # Start new tailer
         self._tailer_cancel = asyncio.Event()
         self.tailer_task = asyncio.create_task(self.transcript_tailer(self._tailer_cancel))
+        
+        # Start queue monitor
+        if self.queue_monitor_task and not self.queue_monitor_task.done():
+            self.queue_monitor_task.cancel()
+        
+        async def on_state_change(state_data):
+            await self.broadcast({"type": "queue_update", "messages": state_data.get("messages", [])})
+            await self.broadcast({"type": "tasks_update", "tasks": state_data.get("tasks", [])})
+
+        self.queue_monitor_task = asyncio.create_task(
+            self.cdp_client.monitor_queue(on_state_change, self.state.active_conversation_id)
+        )
+        
         if self.state.active_conversation_id:
             print(f"[TAILER] Started for conversation {self.state.active_conversation_id[:12]}...", flush=True)
+            print(f"[QUEUE_MONITOR] Started for conversation {self.state.active_conversation_id[:12]}...", flush=True)
         else:
             print("[TAILER] No conversation selected", flush=True)
 
@@ -275,8 +290,9 @@ class WebSocketServer:
                         convos = self.project_manager.find_conversations_for_project(folder_name)
 
                         if convos:
-                            # Auto-select most recent
-                            selected = convos[0]
+                            # Auto-select most recent main conversation (not a subagent)
+                            main_convos = [c for c in convos if not c.get("parentId")]
+                            selected = main_convos[0] if main_convos else convos[0]
                             self.state.active_conversation_id = selected["id"]
                             self.state.active_project_name = project_name
                             self.state.update()
@@ -316,12 +332,70 @@ class WebSocketServer:
                             print("Error: Missing project name in create_project", file=sys.stderr)
                             continue
                         
-                        print(f"[CREATE_PROJECT] {project_name}", flush=True)
+                        print(f"[CREATE_PROJECT] Received request: '{project_name}'", flush=True)
                         
-                        self.project_manager.create_project(project_name)
+                        if mock:
+                            print("[CREATE_PROJECT] Mock mode — skipping", flush=True)
+                            continue
                         
-                        # 3. Broadcast updated projects list
+                        # 1. Create the directory on disk
+                        import os
+                        dev_dir = r"C:\Development"
+                        project_path = os.path.join(dev_dir, project_name)
+                        os.makedirs(project_path, exist_ok=True)
+                        print(f"[CREATE_PROJECT] Directory created: {project_path}", flush=True)
+                        
+                        # 2. Use CDP to create the project in Antigravity's UI
+                        try:
+                            success = await self.cdp_client.inject_create_project(
+                                project_name,
+                                self.state.active_conversation_id
+                            )
+                            if success:
+                                print(f"[CREATE_PROJECT] Project created in Antigravity (section: {success})", flush=True)
+                                
+                                # Use the section ID from the URL as the active conversation
+                                # This prevents inject_chat from navigating back to the old conversation
+                                self.state.active_project_name = project_name
+                                if success != "created":
+                                    self.state.active_conversation_id = success
+                                    print(f"[CREATE_PROJECT] Set active conversation to {success[:12]}...", flush=True)
+                                else:
+                                    # Fallback: clear the conversation ID so inject_chat
+                                    # uses whatever page is currently open
+                                    self.state.active_conversation_id = None
+                                    print(f"[CREATE_PROJECT] No section ID found, cleared active conversation", flush=True)
+                                self.state.update()
+                                
+                                await self.broadcast({
+                                    "type": "project_selected",
+                                    "project": project_name,
+                                    "conversationId": self.state.active_conversation_id or "",
+                                    "firstMessage": ""
+                                })
+                                await self.broadcast({
+                                    "type": "chat",
+                                    "role": "system",
+                                    "message": f"✅ Project '{project_name}' created and selected."
+                                })
+                            else:
+                                print(f"[CREATE_PROJECT] CDP creation failed", file=sys.stderr, flush=True)
+                                await self.broadcast({
+                                    "type": "chat",
+                                    "role": "system",
+                                    "message": f"⚠️ Could not create project in Antigravity UI. Directory created at {project_path}."
+                                })
+                        except Exception as e:
+                            print(f"[CREATE_PROJECT] Error: {e}", file=sys.stderr, flush=True)
+                            await self.broadcast({
+                                "type": "chat",
+                                "role": "system",
+                                "message": f"⚠️ Error creating project: {e}"
+                            })
+                        
+                        # 3. Refresh project list and broadcast to mobile
                         new_projects = self.project_manager.get_projects_with_details()
+                        print(f"[CREATE_PROJECT] Refreshed project list: {len(new_projects)} projects", flush=True)
                         await self.broadcast({
                             "type": "handshake",
                             "data": {
@@ -364,6 +438,42 @@ class WebSocketServer:
                                         print(f"[SET_MODEL] CDP failed, check Antigravity is running", file=sys.stderr, flush=True)
                                 except Exception as e:
                                     print(f"Error setting model: {e}", file=sys.stderr)
+
+                    # ─── Update Project Settings ───
+                    elif event == "update_settings":
+                        turbo = data.get("turbo", False)
+                        project_name = self.state.active_project_name
+                        print(f"[UPDATE_SETTINGS] turbo={turbo} for {project_name}", flush=True)
+                        
+                        if not project_name:
+                            print("Error: No project selected to update settings", file=sys.stderr)
+                            continue
+                            
+                        # Get project details
+                        projects = self.project_manager.get_projects_with_details()
+                        project = next((p for p in projects if p["name"] == project_name), None)
+                        if not project:
+                            print(f"Error: Project '{project_name}' not found", file=sys.stderr)
+                            continue
+                            
+                        project_id = project.get("id")
+                        folder_uri = project.get("folderUri", "")
+                        
+                        if not project_id:
+                            print(f"Error: Project '{project_name}' has no ID", file=sys.stderr)
+                            continue
+                            
+                        try:
+                            success = self.project_manager.update_project_settings(
+                                project_id=project_id,
+                                is_turbo=turbo
+                            )
+                            if success:
+                                print(f"[UPDATE_SETTINGS] Settings updated successfully via file watcher", flush=True)
+                            else:
+                                print(f"[UPDATE_SETTINGS] Failed to update settings via file watcher", file=sys.stderr)
+                        except Exception as e:
+                            print(f"Error updating settings: {e}", file=sys.stderr)
 
                     # ─── Chat Message Injection via CDP ───
                     elif event == "chat":
@@ -410,6 +520,102 @@ class WebSocketServer:
                                         print(f"[IMAGE] Saved to {filepath} but CDP injection failed", file=sys.stderr, flush=True)
                             elif not self.state.active_conversation_id:
                                 print("Error: No conversation selected for image", file=sys.stderr)
+
+                    # ─── Stop Agent Execution ───
+                    elif event == "stop":
+                        print("[STOP] Received stop request", flush=True)
+                        if not mock:
+                            if not self.state.active_conversation_id:
+                                print("Error: No conversation selected for stop", file=sys.stderr)
+                                continue
+                            try:
+                                success = await self.cdp_client.inject_stop(self.state.active_conversation_id)
+                                if success:
+                                    print("[STOP] Agent stopped via CDP", flush=True)
+                                    await self.broadcast({
+                                        "type": "chat",
+                                        "role": "system",
+                                        "message": "🛑 Agent execution stopped."
+                                    })
+                                else:
+                                    print("[STOP] CDP stop failed", file=sys.stderr, flush=True)
+                                    await self.broadcast({
+                                        "type": "chat",
+                                        "role": "system",
+                                        "message": "⚠️ Stop failed — agent may not be running."
+                                    })
+                            except Exception as e:
+                                print(f"Error stopping agent: {e}", file=sys.stderr)
+
+                    # ─── Approve / Reject Permission Request ───
+                    elif event == "approve":
+                        option_index = data.get("option_index", 0)
+                        option_text = data.get("option_text", "")
+                        # Antigravity's ask_permission reads 1-indexed numeric responses from chat
+                        # Option 0 (Approve) = "1", Option 1 (Approve Once) = "2", etc.
+                        numeric_response = str(option_index + 1)
+                        print(f"[APPROVE] Received: option={option_index} ('{option_text}') -> injecting '{numeric_response}'", flush=True)
+                        if not mock:
+                            try:
+                                # Force port rediscovery to ensure freshness
+                                import asyncio
+                                await asyncio.to_thread(self.cdp_client.discover_port)
+                                print(f"[APPROVE] CDP port: {self.cdp_client._cdp_port}", flush=True)
+                                
+                                # Use inject_keystrokes — the permission dialog removes
+                                # the contenteditable, so inject_chat won't work here.
+                                success = await self.cdp_client.inject_keystrokes(
+                                    numeric_response,
+                                    self.state.active_conversation_id
+                                )
+                                if success:
+                                    print(f"[APPROVE] Injected '{numeric_response}' via keystrokes", flush=True)
+                                else:
+                                    print(f"[APPROVE] Keystroke inject failed", file=sys.stderr, flush=True)
+                                    await self.broadcast({
+                                        "type": "chat",
+                                        "role": "system",
+                                        "message": "⚠️ Could not send approval response to Antigravity."
+                                    })
+                            except Exception as e:
+                                print(f"Error in approve: {e}", file=sys.stderr, flush=True)
+                                import traceback
+                                traceback.print_exc()
+                                await self.broadcast({
+                                    "type": "chat",
+                                    "role": "system",
+                                    "message": f"⚠️ Approval error: {str(e)[:100]}"
+                                })
+
+                    # ─── Queue Management ───
+                    elif event == "manage_queue":
+                        index = data.get("index")
+                        action = data.get("action")
+                        if index is not None and action:
+                            print(f"[MANAGE_QUEUE] Action: '{action}' at index: {index}", flush=True)
+                            if not mock and self.state.active_conversation_id:
+                                try:
+                                    success = await self.cdp_client.manage_queued_message(
+                                        index, action, self.state.active_conversation_id
+                                    )
+                                    if success:
+                                        print(f"[MANAGE_QUEUE] CDP action successful", flush=True)
+                                    else:
+                                        print(f"[MANAGE_QUEUE] CDP action failed", file=sys.stderr, flush=True)
+                                except Exception as e:
+                                    print(f"Error managing queue: {e}", file=sys.stderr)
+
+                    # ─── Stop Task ───
+                    elif event == "stop_task":
+                        task_id = data.get("taskId")
+                        if task_id:
+                            print(f"[STOP_TASK] Action for task: {task_id}", flush=True)
+                            if not mock and self.state.active_conversation_id:
+                                try:
+                                    await self.cdp_client.stop_task(task_id, self.state.active_conversation_id)
+                                    print(f"[STOP_TASK] CDP action sent", flush=True)
+                                except Exception as e:
+                                    print(f"Error stopping task: {e}", file=sys.stderr)
 
                     # ─── Legacy Events (no-op stubs) ───
                     elif event in ("mouse_move", "mouse_click", "keyboard_input"):

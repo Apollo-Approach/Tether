@@ -47,7 +47,7 @@ A core feature of the receiver is the `transcript_tailer` background task. Becau
    - `PLANNER_RESPONSE`: Broadcasts the agent's textual response.
    - **Tool Calls**: It intercepts specific tool calls made by the agent:
      - `write_to_file`: If the agent creates or updates a Markdown (`.md`) file, the tailer extracts the `Summary` (title) and `CodeContent` (body) and broadcasts an `artifact` payload. This allows remote clients to render the agent's Implementation Plans and Task lists natively.
-     - `ask_permission` / `ask_question`: Broadcasts an `approval_request` payload to the client so the user can remotely approve actions or answer questions.
+     - `ask_permission` / `ask_question`: Broadcasts an `approval_request` payload to the client so the user can remotely approve actions or answer questions. See **Section 5** below for details.
 
 ---
 
@@ -78,6 +78,61 @@ Chat messages from the mobile app are injected into the Antigravity desktop app 
 When a mobile client selects a project, the receiver maps that project to its conversations using the authoritative DB metadata (same approach as project ordering — see Section 1). It auto-selects the most recently active conversation and starts tailing its transcript.
 
 > **⚠️ Important — Subagent View Pitfall**: Do NOT check `document.body.innerText.includes('Cannot send message to subagent')` when the desktop is already on the correct conversation. This text can appear in the sidebar even on the main conversation view, causing false-positive re-navigation that flashes the screen on every message. Only run this check after navigating to a *different* conversation.
+
+---
+
+## 5. Remote Approval via CDP Keystrokes
+
+When the agent calls `ask_permission`, the tailer intercepts it and broadcasts an `approval_request` to connected mobile clients. The client renders approval buttons (Approve, Approve Once, Approve Project, Deny). When tapped, the receiver injects the response back into Antigravity.
+
+### Critical Architecture Detail
+
+Antigravity's permission dialog renders numbered options in the chat as plain `<LI>` text:
+```
+1 = Approve
+2 = Approve Once
+3 = Approve (Project)
+4 = Deny
+```
+
+The dialog is a **native Electron overlay** that:
+- Is NOT accessible via DOM search (`document.querySelectorAll` finds nothing clickable)
+- **Removes the `[contenteditable="true"]` chat input from the DOM** while active
+- Accepts a typed number (1-4) followed by Enter as the response
+
+### Why `inject_chat` Fails Here
+
+`inject_chat` relies on finding `[contenteditable="true"]` to focus and type into. Since the permission dialog removes this element, `inject_chat` always returns `False` during active approval requests.
+
+### Solution: `inject_keystrokes`
+
+The `inject_keystrokes` method in `cdp_client.py` bypasses DOM element lookup entirely:
+1. Dispatches raw `Input.dispatchKeyEvent` CDP events (keyDown + keyUp for each character)
+2. Presses Enter via the same mechanism
+3. Works regardless of DOM state — types into whatever element currently has focus
+
+### Approval Flow
+1. Android taps "Approve" → sends `{"event": "approve", "option_index": 0}`
+2. Receiver converts to 1-indexed string: `"1"`
+3. Receiver calls `inject_keystrokes("1", conversation_id)` via CDP
+4. Antigravity receives the keystroke and grants the permission
+
+> **⚠️ Important**: Do NOT use `inject_chat` for approval responses. Always use `inject_keystrokes`. Do NOT attempt to navigate to a conversation URL before typing — navigation will dismiss the active permission dialog.
+
+---
+
+## 6. Message Queue Mirroring
+
+The receiver implements a real-time, push-based synchronization of the Antigravity desktop message queue to the connected mobile clients.
+
+### How it Works
+1. **DOM Injection**: When a client connects and selects a conversation, the receiver's `cdp_client.py` injects a `MutationObserver` directly into the Antigravity desktop DOM using `Runtime.evaluate`.
+2. **Observation**: The observer watches the `[data-testid="queued-messages-card"]` element for any structural or text changes.
+3. **Binding Callback**: Whenever the queue changes (message added, edited, or deleted), the observer serializes the updated queue and triggers a CDP binding callback (`roverQueueCallback`), pushing the data back to Python.
+4. **WebSocket Broadcast**: The `ws_server.py` ingests this callback and immediately broadcasts a `queue_update` JSON event to all connected clients.
+5. **Mobile Queue Management**: The mobile app allows users to Edit, Delete, or Send Now. These actions are sent as `manage_queue` events to the receiver, which synthesizes CDP clicks on the corresponding Antigravity desktop UI buttons using their `aria-label`.
+
+---
 
 ## CLI Usage
 

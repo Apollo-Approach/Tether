@@ -264,15 +264,19 @@ class ProjectManager:
             print("Error: Missing project name in create_project", file=sys.stderr)
             return
         
-        print(f"[CREATE_PROJECT] {project_name}", flush=True)
+        print(f"[CREATE_PROJECT] Starting creation: '{project_name}'", flush=True)
         
         # 1. Create directory
         dev_dir = r"C:\Development"
         project_path = os.path.join(dev_dir, project_name)
         os.makedirs(project_path, exist_ok=True)
+        print(f"[CREATE_PROJECT] Directory created: {project_path} (exists={os.path.isdir(project_path)})", flush=True)
         
         # 2. Create Rover JSON
         proj_id = str(uuid.uuid4())
+        folder_uri = f"file:///c%3A/Development/{urllib.parse.quote(project_name)}"
+        print(f"[CREATE_PROJECT] Generated ID: {proj_id}, folderUri: {folder_uri}", flush=True)
+        
         proj_json = {
           "id": proj_id,
           "name": project_name,
@@ -280,7 +284,7 @@ class ProjectManager:
             "resources": [
               {
                 "gitFolder": {
-                  "folderUri": f"file:///c%3A/Development/{urllib.parse.quote(project_name)}",
+                  "folderUri": folder_uri,
                   "defaultBranch": "main",
                   "allowWrite": True
                 }
@@ -299,3 +303,28 @@ class ProjectManager:
         json_path = os.path.join(self.projects_dir, f"{proj_id}.json")
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(proj_json, f, indent=2)
+        print(f"[CREATE_PROJECT] JSON written: {json_path} (exists={os.path.isfile(json_path)})", flush=True)
+
+    def update_project_settings(self, project_id: str, is_turbo: bool):
+        json_path = os.path.join(self.projects_dir, f"{project_id}.json")
+        if not os.path.exists(json_path):
+            return False
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            
+            if "settings" not in data:
+                data["settings"] = {}
+                
+            data["settings"]["fileAccessPolicy"] = "AGENT_SETTING_POLICY_ALLOW" if is_turbo else "AGENT_SETTING_POLICY_ASK"
+            data["settings"]["autoExecutionPolicy"] = "CASCADE_COMMANDS_AUTO_EXECUTION_EAGER" if is_turbo else "CASCADE_COMMANDS_AUTO_EXECUTION_OFF"
+            
+            from datetime import datetime, timezone
+            data["updatedAt"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            return True
+        except Exception as e:
+            print(f"Error updating project settings: {e}")
+            return False

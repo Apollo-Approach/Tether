@@ -66,6 +66,7 @@ class AppState:
         self.logs = []
         self.tailscale_auth_url = None
         self.tailscale_ip = None
+        self.proxy_proc = None
 
     def update(self):
         if self.on_change:
@@ -118,12 +119,12 @@ async def run_server(args):
     if os.path.exists(proxy_path):
         def run_proxy():
             try:
-                proc = subprocess.Popen(
+                state.proxy_proc = subprocess.Popen(
                     [proxy_path],
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, bufsize=1
                 )
-                for line in proc.stdout:
+                for line in state.proxy_proc.stdout:
                     line = line.strip()
                     if "TAILSCALE_AUTH_URL:" in line:
                         url = line.split("TAILSCALE_AUTH_URL:")[1].strip()
@@ -271,7 +272,7 @@ async def flet_main(page: ft.Page):
         ),
         actions=[
             ft.TextButton("Cancel", on_click=cancel_preferences),
-            ft.ElevatedButton("Save", on_click=save_preferences),
+            ft.Button("Save", on_click=save_preferences),
         ],
         actions_alignment=ft.MainAxisAlignment.END,
     )
@@ -364,7 +365,22 @@ async def flet_main(page: ft.Page):
     )
 
     args = parse_args()
-    asyncio.create_task(run_server(args))
+    server_task = asyncio.create_task(run_server(args))
+
+    def on_window_event(e):
+        if e.data == "close":
+            if state.proxy_proc:
+                try:
+                    state.proxy_proc.terminate()
+                except:
+                    pass
+            server_task.cancel()
+            page.window.destroy()
+            os._exit(0)
+
+    page.window.prevent_close = True
+    page.window.on_event = on_window_event
+
     state.update()
 
 if __name__ == "__main__":
@@ -373,4 +389,4 @@ if __name__ == "__main__":
             sys.stdout.reconfigure(encoding='utf-8', errors='backslashreplace')
         if hasattr(sys.stderr, 'reconfigure'):
             sys.stderr.reconfigure(encoding='utf-8', errors='backslashreplace')
-    ft.app(target=flet_main)
+    ft.run(main=flet_main)

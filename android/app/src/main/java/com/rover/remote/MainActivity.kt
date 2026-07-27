@@ -12,6 +12,7 @@ import android.net.nsd.NsdServiceInfo
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.result.PickVisualMediaRequest
@@ -54,6 +55,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.foundation.Canvas
@@ -254,6 +256,10 @@ fun RemoteControlScreen() {
     val currentProject = state.currentProject
     val isThinking = state.isThinking
     
+    BackHandler(enabled = currentArtifact != null) {
+        ConnectionRepository.setArtifact(null)
+    }
+    
     val scope = rememberCoroutineScope()
     val webSocketManager = ConnectionRepository.webSocketManager
     
@@ -444,12 +450,24 @@ fun RemoteControlScreen() {
                             TextButton(
                                 onClick = { 
                                     if (newProjectName.isNotBlank()) {
-                                        val payload = org.json.JSONObject().apply {
+                                        val trimmedName = newProjectName.trim()
+                                        // 1. Create the project
+                                        val createPayload = org.json.JSONObject().apply {
                                             put("event", "create_project")
-                                            put("name", newProjectName.trim())
+                                            put("name", trimmedName)
                                         }
-                                        ConnectionRepository.webSocketManager?.send(payload.toString())
-                                        showNewProjectDialog = false 
+                                        ConnectionRepository.webSocketManager?.send(createPayload.toString())
+                                        
+                                        // 2. Switch to the new project immediately
+                                        ConnectionRepository.setCurrentProject(trimmedName)
+                                        val selectPayload = org.json.JSONObject().apply {
+                                            put("event", "select_project")
+                                            put("project", trimmedName)
+                                        }
+                                        ConnectionRepository.webSocketManager?.send(selectPayload.toString())
+                                        
+                                        showNewProjectDialog = false
+                                        scope.launch { drawerState.close() }
                                     }
                                 }
                             ) {
@@ -625,6 +643,21 @@ fun RemoteControlScreen() {
                             }
                         },
                         actions = {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    text = "Turbo",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Switch(
+                                    checked = state.isTurboMode,
+                                    onCheckedChange = { isChecked ->
+                                        ConnectionRepository.updateTurboMode(isChecked)
+                                    },
+                                    modifier = Modifier.scale(0.7f)
+                                )
+                            }
                             IconButton(onClick = { showVoiceSettings = true }) {
                                 Icon(Icons.Default.Settings, contentDescription = "Settings")
                             }
@@ -775,8 +808,17 @@ fun RemoteControlScreen() {
                 // Main Chat Area
                 val listState = androidx.compose.foundation.lazy.rememberLazyListState()
                 
+                androidx.compose.runtime.LaunchedEffect(chatMessages.size) {
+                    if (chatMessages.isNotEmpty()) {
+                        listState.animateScrollToItem(0)
+                    }
+                }
+                
                 Column(modifier = Modifier.fillMaxSize()) {
-                    Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                    Box(
+                        modifier = Modifier.weight(1f).fillMaxWidth(),
+                        contentAlignment = Alignment.BottomCenter
+                    ) {
                         // Empty state
                         androidx.compose.animation.AnimatedVisibility(
                             visible = chatMessages.isEmpty(),
@@ -806,7 +848,7 @@ fun RemoteControlScreen() {
 
                         LazyColumn(
                             state = listState,
-                            modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 8.dp),
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
                             reverseLayout = true,
                             verticalArrangement = Arrangement.spacedBy(2.dp)
                         ) {
@@ -908,6 +950,25 @@ fun RemoteControlScreen() {
                                     style = MaterialTheme.typography.labelMedium,
                                     color = Amber.copy(alpha = 0.7f)
                                 )
+                                Spacer(modifier = Modifier.weight(1f))
+                                // Stop button — sends Ctrl+D to Antigravity via CDP
+                                IconButton(
+                                    onClick = {
+                                        val json = JSONObject().apply {
+                                            put("event", "stop")
+                                        }
+                                        ConnectionRepository.webSocketManager?.send(json.toString())
+                                        ConnectionRepository.setThinking(false)
+                                    },
+                                    modifier = Modifier.size(32.dp)
+                                ) {
+                                    Icon(
+                                        Icons.Default.Stop,
+                                        contentDescription = "Stop Agent",
+                                        tint = Color(0xFFEF5350),
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
                             }
                             if (currentThoughts.isNotEmpty()) {
                                 Surface(
@@ -956,14 +1017,13 @@ fun RemoteControlScreen() {
                                             request.options.forEachIndexed { index, optionText ->
                                                 Button(
                                                     onClick = {
-                                                        val messageValue = (index + 1).toString()
                                                         val responseJson = JSONObject().apply {
-                                                            put("event", "chat")
-                                                            put("message", messageValue)
+                                                            put("event", "approve")
+                                                            put("option_index", index)
+                                                            put("option_text", optionText)
                                                         }
-                                                        if (connectionStatus == "Connected") {
-                                                            webSocketManager?.send(responseJson.toString())
-                                                        }
+                                                        ConnectionRepository.webSocketManager?.send(responseJson.toString())
+                                                        ConnectionRepository.addChatMessage(ChatMessage("system", "📤 Sent approval: $optionText (index=$index)"))
                                                         ConnectionRepository.setApprovalRequest(null)
                                                     },
                                                     colors = ButtonDefaults.buttonColors(
@@ -1089,8 +1149,8 @@ fun RemoteControlScreen() {
                     val modelOptions = listOf(
                         "3.5 Flash" to "Gemini 3.5 Flash (High)",
                         "3.1 Pro" to "Gemini 3.1 Pro (High)",
-                        "Claude 4.6" to "Claude Sonnet 4.6 (Thinking)",
-                        "GPT-OSS" to "GPT-OSS 120B (Medium)"
+                        "Sonnet 4.6" to "Claude Sonnet 4.6 (Thinking)",
+                        "Opus 4.6" to "Claude Opus 4.6 (Thinking)"
                     )
 
                     // Expandable chip row (expands upward, above the toggle)
@@ -1160,6 +1220,189 @@ fun RemoteControlScreen() {
                         )
                     }
                     
+                    // Running Tasks UI
+                    val runningTasks = state.runningTasks
+                    if (runningTasks.isNotEmpty()) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 4.dp)
+                        ) {
+                            Text(
+                                text = "Running Tasks",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = TextSecondary,
+                                modifier = Modifier.padding(bottom = 4.dp)
+                            )
+                            runningTasks.forEach { task ->
+                                Surface(
+                                    shape = RoundedCornerShape(12.dp),
+                                    color = DarkSurfaceVariant,
+                                    border = BorderStroke(1.dp, DividerColor),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(bottom = 8.dp)
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .padding(12.dp)
+                                            .fillMaxWidth(),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Text(
+                                            text = task.name,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = TextPrimary,
+                                            modifier = Modifier.weight(1f),
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        
+                                        Surface(
+                                            shape = RoundedCornerShape(8.dp),
+                                            color = Color.Transparent,
+                                            border = BorderStroke(1.dp, DividerColor),
+                                            modifier = Modifier.clickable {
+                                                ConnectionRepository.webSocketManager?.send(org.json.JSONObject().apply {
+                                                    put("event", "stop_task")
+                                                    put("taskId", task.id)
+                                                }.toString())
+                                            }
+                                        ) {
+                                            Row(
+                                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.Stop,
+                                                    contentDescription = "Stop Task",
+                                                    tint = Color(0xFFF87171), // Red-400
+                                                    modifier = Modifier.size(16.dp)
+                                                )
+                                                Spacer(modifier = Modifier.width(4.dp))
+                                                Text(
+                                                    text = "Stop",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = Color(0xFFF87171)
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Queued Messages UI
+                    val queuedMessages = state.queuedMessages
+                    if (queuedMessages.isNotEmpty()) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 4.dp)
+                        ) {
+                            Text(
+                                text = "Queued Messages",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = TextSecondary,
+                                modifier = Modifier.padding(bottom = 4.dp)
+                            )
+                            queuedMessages.forEachIndexed { index, msg ->
+                                Surface(
+                                    shape = RoundedCornerShape(12.dp),
+                                    color = DarkSurfaceVariant,
+                                    border = BorderStroke(1.dp, DividerColor),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(bottom = 8.dp)
+                                ) {
+                                    Column(modifier = Modifier.padding(12.dp)) {
+                                        Text(
+                                            text = msg,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = TextPrimary,
+                                            maxLines = 3,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Spacer(modifier = Modifier.height(8.dp))
+                                        Row(
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            // Edit Button
+                                            Surface(
+                                                shape = RoundedCornerShape(8.dp),
+                                                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f),
+                                                modifier = Modifier.clickable {
+                                                    chatInput = TextFieldValue(msg)
+                                                    val json = JSONObject().apply {
+                                                        put("event", "manage_queue")
+                                                        put("index", index)
+                                                        put("action", "delete")
+                                                    }
+                                                    ConnectionRepository.webSocketManager?.send(json.toString())
+                                                }
+                                            ) {
+                                                Text(
+                                                    "Edit",
+                                                    fontSize = 11.sp,
+                                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                                )
+                                            }
+
+                                            // Send Now Button
+                                            Surface(
+                                                shape = RoundedCornerShape(8.dp),
+                                                color = Amber.copy(alpha = 0.2f),
+                                                modifier = Modifier.clickable {
+                                                    val json = JSONObject().apply {
+                                                        put("event", "manage_queue")
+                                                        put("index", index)
+                                                        put("action", "send")
+                                                    }
+                                                    ConnectionRepository.webSocketManager?.send(json.toString())
+                                                }
+                                            ) {
+                                                Text(
+                                                    "Send Now",
+                                                    fontSize = 11.sp,
+                                                    color = Amber,
+                                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                                )
+                                            }
+                                            
+                                            Spacer(modifier = Modifier.weight(1f))
+
+                                            // Delete Button
+                                            IconButton(
+                                                onClick = {
+                                                    val json = JSONObject().apply {
+                                                        put("event", "manage_queue")
+                                                        put("index", index)
+                                                        put("action", "delete")
+                                                    }
+                                                    ConnectionRepository.webSocketManager?.send(json.toString())
+                                                },
+                                                modifier = Modifier.size(24.dp)
+                                            ) {
+                                                Icon(
+                                                    Icons.Default.Delete,
+                                                    contentDescription = "Delete",
+                                                    tint = Color(0xFFEF5350),
+                                                    modifier = Modifier.size(16.dp)
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Chat Input box
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(8.dp),

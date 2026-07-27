@@ -63,15 +63,25 @@ class RoverService : Service() {
                             }
                             ConnectionRepository.setProjects(projects)
                         }
+                        
                         val currentProject = dataObj.optString("current_project", "")
-                        if (currentProject.isNotEmpty()) {
-                            ConnectionRepository.setCurrentProject(currentProject)
-                        }
                         val activeProject = dataObj.optString("activeProject", "")
-                        if (activeProject.isNotEmpty()) {
-                            ConnectionRepository.setCurrentProject(activeProject)
-                        }
                         val activeConv = dataObj.optString("activeConversation", "")
+                        
+                        val projectToUse = if (activeProject.isNotEmpty()) activeProject else currentProject
+                        
+                        if (projectToUse.isNotEmpty()) {
+                            ConnectionRepository.setCurrentProject(projectToUse)
+                            // Auto-select the project on the backend if no conversation is currently active
+                            if (activeConv.isEmpty()) {
+                                val payload = org.json.JSONObject().apply {
+                                    put("event", "select_project")
+                                    put("project", projectToUse)
+                                }
+                                ConnectionRepository.webSocketManager?.send(payload.toString())
+                            }
+                        }
+                        
                         if (activeConv.isNotEmpty()) {
                             ConnectionRepository.setActiveConversation(activeConv, "")
                         }
@@ -86,7 +96,6 @@ class RoverService : Service() {
                         }
                     }
                     ConnectionRepository.setApprovalRequest(ApprovalRequest(title, optionsList))
-                    ConnectionRepository.addChatMessage(ChatMessage("system", "[DEBUG] Received approval request: $title with ${optionsList.size} options"))
                     showMessageNotification("Approval Needed", title)
                 } else if (type == "project_selected") {
                     val project = json.optString("project", "")
@@ -118,6 +127,28 @@ class RoverService : Service() {
                     val textContent = json.optString("text", "")
                     if (textContent.isNotEmpty()) {
                         ConnectionRepository.appendThought(textContent)
+                    }
+                } else if (type == "tasks_update") {
+                    val tasksArray = json.optJSONArray("tasks")
+                    if (tasksArray != null) {
+                        val tasksList = mutableListOf<RunningTask>()
+                        for (i in 0 until tasksArray.length()) {
+                            val taskObj = tasksArray.getJSONObject(i)
+                            tasksList.add(RunningTask(
+                                id = taskObj.getString("id"),
+                                name = taskObj.getString("name")
+                            ))
+                        }
+                        ConnectionRepository.setRunningTasks(tasksList)
+                    }
+                } else if (type == "queue_update") {
+                    val messagesArray = json.optJSONArray("messages")
+                    if (messagesArray != null) {
+                        val msgsList = mutableListOf<String>()
+                        for (i in 0 until messagesArray.length()) {
+                            msgsList.add(messagesArray.getString(i))
+                        }
+                        ConnectionRepository.setQueuedMessages(msgsList)
                     }
                 }
             } catch (e: Exception) {
@@ -183,12 +214,16 @@ class RoverService : Service() {
             .setContentIntent(pendingIntent)
             .build()
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-        } else {
-            startForeground(1, notification)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+            } else {
+                startForeground(1, notification)
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("RoverService", "Failed to start foreground: ${e.message}")
         }
 
         if (intent?.action == ACTION_CONNECT) {
@@ -197,11 +232,11 @@ class RoverService : Service() {
                 stopDiscovery()
                 connectWebSocket(url)
             }
-            return START_STICKY
+            return START_NOT_STICKY
         }
         
         startDiscovery()
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
 
@@ -290,6 +325,16 @@ class RoverService : Service() {
                     if (json.optString("type") == "auth_success") {
                         ConnectionRepository.updateConnectionStatus("Connected")
                         updateForegroundNotification("Connected to Rover")
+                        
+                        // Auto-reselect last project on reconnect
+                        val savedProject = ConnectionRepository.state.value.currentProject
+                        if (savedProject.isNotEmpty()) {
+                            val payload = org.json.JSONObject().apply {
+                                put("event", "select_project")
+                                put("project", savedProject)
+                            }
+                            webSocketManager.send(payload.toString())
+                        }
                         return
                     }
                 } catch(e: Exception) {}

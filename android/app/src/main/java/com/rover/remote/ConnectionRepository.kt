@@ -19,7 +19,14 @@ enum class InteractionMode(val label: String, val description: String) {
     SILENT("Silent", "Text only, no audio")
 }
 
+
+data class RunningTask(
+    val id: String,
+    val name: String
+)
+
 data class AppState(
+
     val connectionStatus: String = "Disconnected",
     val chatMessages: List<ChatMessage> = emptyList(),
     val currentArtifact: ArtifactMessage? = null,
@@ -34,7 +41,10 @@ data class AppState(
     val thinkingStartTime: Long? = null,
     val currentThoughts: String = "",
     val currentModel: String = "Gemini 3.5 Flash (High)",
-    val interactionMode: InteractionMode = InteractionMode.SILENT
+    val interactionMode: InteractionMode = InteractionMode.SILENT,
+    val isTurboMode: Boolean = false,
+    val queuedMessages: List<String> = emptyList(),
+    val runningTasks: List<RunningTask> = emptyList()
 )
 
 object ConnectionRepository {
@@ -45,6 +55,11 @@ object ConnectionRepository {
 
     fun updateConnectionStatus(status: String) {
         _state.update { it.copy(connectionStatus = status) }
+    }
+
+    fun updateTurboMode(turbo: Boolean) {
+        _state.update { it.copy(isTurboMode = turbo) }
+        webSocketManager?.send("""{"event":"update_settings","turbo":$turbo}""")
     }
 
     fun updateCurrentModel(model: String) {
@@ -75,6 +90,8 @@ object ConnectionRepository {
     }
 
     fun setCurrentProject(project: String) {
+        if (_state.value.currentProject == project) return
+        
         _state.update { it.copy(
             currentProject = project,
             chatMessages = emptyList(),
@@ -124,4 +141,13 @@ object ConnectionRepository {
     fun updateInteractionMode(mode: InteractionMode) {
         _state.update { it.copy(interactionMode = mode) }
     }
+
+    fun setQueuedMessages(messages: List<String>) {
+        _state.update { it.copy(queuedMessages = messages) }
+    }
+
+    fun setRunningTasks(tasks: List<RunningTask>) {
+        _state.update { it.copy(runningTasks = tasks) }
+    }
+
 }
