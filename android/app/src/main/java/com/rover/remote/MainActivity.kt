@@ -329,9 +329,10 @@ fun RemoteControlScreen() {
                                     ConnectionRepository.updateConnectionStatus("Connecting...")
                                     val targetHost = if (peer.ip.isNotBlank()) peer.ip else peer.hostname
                                     android.util.Log.e("RoverClick", "Target host: $targetHost")
+                                    val formattedHost = if (targetHost.contains(":") && !targetHost.startsWith("[")) "[$targetHost]" else targetHost
                                     val intent = Intent(context, RoverService::class.java).apply {
                                         action = "com.rover.remote.CONNECT"
-                                        putExtra("url", "ws://$targetHost:8765")
+                                        putExtra("url", "ws://$formattedHost:8765")
                                     }
                                     androidx.core.content.ContextCompat.startForegroundService(context, intent)
                                     android.util.Log.e("RoverClick", "Started service, closing drawer...")
