@@ -51,6 +51,7 @@ class RoverCDPClient:
         """Discover Rover's Chrome DevTools Protocol port by scanning its process."""
         try:
             # Find Rover process and its listening port
+            creationflags = 0x08000000 if sys.platform == 'win32' else 0
             result = subprocess.run(
                 ['powershell', '-Command',
                  'Get-Process -Name Antigravity -ErrorAction SilentlyContinue | '
@@ -59,7 +60,7 @@ class RoverCDPClient:
                  '"*--type=*"}).ProcessId} | ForEach-Object { '
                  '(Get-NetTCPConnection -OwningProcess $_.Id -State Listen '
                  '-ErrorAction SilentlyContinue).LocalPort }'],
-                capture_output=True, text=True, timeout=10
+                capture_output=True, text=True, timeout=10, creationflags=creationflags
             )
             ports = [int(p.strip()) for p in result.stdout.strip().split('\n') if p.strip().isdigit()]
             for port in ports:
@@ -77,13 +78,14 @@ class RoverCDPClient:
     
         # Fallback: brute-scan likely port range
         try:
+            creationflags = 0x08000000 if sys.platform == 'win32' else 0
             result = subprocess.run(
                 ['powershell', '-Command',
                  'Get-NetTCPConnection -OwningProcess '
                  '(Get-Process -Name Antigravity -ErrorAction SilentlyContinue).Id '
                  '-State Listen -ErrorAction SilentlyContinue | '
                  'Select-Object -ExpandProperty LocalPort'],
-                capture_output=True, text=True, timeout=10
+                capture_output=True, text=True, timeout=10, creationflags=creationflags
             )
             ports = [int(p.strip()) for p in result.stdout.strip().split('\n') if p.strip().isdigit()]
             for port in ports:

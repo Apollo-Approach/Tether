@@ -172,10 +172,11 @@ async def run_server(args):
         def run_proxy():
             while True:
                 try:
+                    creationflags = 0x08000000 if sys.platform == 'win32' else 0
                     state.proxy_proc = subprocess.Popen(
                         [proxy_path],
                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, bufsize=1
+                        text=True, bufsize=1, creationflags=creationflags
                     )
                     for line in state.proxy_proc.stdout:
                         line = line.strip()
