@@ -17,7 +17,8 @@ import androidx.media.app.NotificationCompat as MediaNotificationCompat
 
 class AudioFocusAndMediaManager(
     private val context: Context,
-    private val onPlayPauseToggle: () -> Unit
+    private val onPlayPauseToggle: () -> Unit,
+    private val onStopAction: () -> Unit
 ) {
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -90,7 +91,7 @@ class AudioFocusAndMediaManager(
 
             override fun onStop() {
                 Log.d("AudioMediaManager", "MediaSession onStop received")
-                onPlayPauseToggle()
+                onStopAction()
                 isPlaying = false
                 updatePlaybackState(PlaybackState.STATE_STOPPED)
                 dismissMediaNotification()
@@ -219,7 +220,7 @@ class AudioFocusAndMediaManager(
 
     fun requestAudioFocus(): Boolean {
         val audioAttributes = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_ASSISTANT)
+            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
             .build()
 
@@ -230,6 +231,26 @@ class AudioFocusAndMediaManager(
                 Log.d("AudioMediaManager", "Focus change: $focusChange")
             }
             .build()
+            
+        audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val devices = audioManager.availableCommunicationDevices
+            val btDevice = devices.firstOrNull { 
+                it.type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO || 
+                it.type == android.media.AudioDeviceInfo.TYPE_BLE_HEADSET 
+            }
+            if (btDevice != null) {
+                audioManager.setCommunicationDevice(btDevice)
+            }
+        }
+        
+        try {
+            audioManager.startBluetoothSco()
+            audioManager.isBluetoothScoOn = true
+        } catch (e: Exception) {
+            Log.e("AudioMediaManager", "Error starting Bluetooth SCO", e)
+        }
 
         val result = audioManager.requestAudioFocus(focusRequest!!)
         
@@ -241,6 +262,18 @@ class AudioFocusAndMediaManager(
     }
 
     fun abandonAudioFocus() {
+        try {
+            audioManager.stopBluetoothSco()
+            audioManager.isBluetoothScoOn = false
+        } catch (e: Exception) {
+            Log.e("AudioMediaManager", "Error stopping Bluetooth SCO", e)
+        }
+        
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            audioManager.clearCommunicationDevice()
+        }
+        audioManager.mode = AudioManager.MODE_NORMAL
+        
         focusRequest?.let {
             audioManager.abandonAudioFocusRequest(it)
         }

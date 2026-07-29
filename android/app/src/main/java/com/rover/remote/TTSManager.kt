@@ -15,6 +15,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
@@ -37,11 +38,10 @@ class TTSManager(private val context: Context, private val onQueueFinished: () -
     private var producerJob: Job? = null
     private var consumerJob: Job? = null
     private var audioTrack: AudioTrack? = null
-    private var audioChannel = Channel<AudioTask>(Channel.BUFFERED)
+    private var sentenceChannel = Channel<String>(Channel.UNLIMITED)
+    private var audioChannel = Channel<AudioTask>(5)
     
-    private val sentenceQueue = mutableListOf<String>()
-    private var currentSentenceIndex = 0
-    @Volatile private var currentlyPlayingIndex = 0
+    private val itemsInFlight = java.util.concurrent.atomic.AtomicInteger(0)
     private var isPaused = false
 
     init {
@@ -107,82 +107,97 @@ class TTSManager(private val context: Context, private val onQueueFinished: () -
         }
     }
 
-    fun speak(text: String) {
+    fun speak(text: String, flush: Boolean = false) {
         if (!isInitialized) return
         
-        // Strip markdown characters (like asterisks and hashes) that shouldn't be spoken
-        val cleanText = text.replace("*", "").replace("#", "")
+        // 1. Convert markdown links [text](url) to just "text"
+        var cleanText = text.replace(Regex("\\[([^\\]]+)\\]\\([^)]+\\)"), "$1")
         
-        // Split only on sentence terminators to avoid awkward mid-sentence pauses at commas
-        val sentences = cleanText.split(Regex("(?<=[.!?])\\s+"))
+        // 2. Truncate Windows paths (e.g. C:\Users\devon\... \file.txt) to just the filename
+        cleanText = cleanText.replace(Regex("""[a-zA-Z]:\\[\\\w\-. ]+\\([\w\-.]+)"""), "$1")
+        
+        // 3. Truncate Unix paths (e.g. /home/user/... /file.txt) 
+        cleanText = cleanText.replace(Regex("""/(?:[\w\-. ]+/)+([\w\-.]+)"""), "$1")
+        
+        // 4. Strip leftover markdown characters
+        cleanText = cleanText.replace("*", "").replace("#", "")
+        
+        val sentences = cleanText.split(Regex("(?<=[.!?,;:\n])\\s+"))
             .map { it.trim() }
             .filter { it.isNotEmpty() }
             
-        sentenceQueue.clear()
-        sentenceQueue.addAll(sentences)
-        currentSentenceIndex = 0
-        currentlyPlayingIndex = 0
-        isPaused = false
+        if (flush) stop()
         
-        if (sentenceQueue.isNotEmpty()) {
-            startPipelines()
-        } else {
-            onQueueFinished()
+        if (sentences.isEmpty()) {
+            if (flush) onQueueFinished()
+            return
         }
+        
+        isPaused = false
+        itemsInFlight.addAndGet(sentences.size)
+        
+        for (s in sentences) {
+            sentenceChannel.trySend(s)
+        }
+        
+        if (producerJob?.isActive != true || consumerJob?.isActive != true) {
+            startPipelines()
+        }
+    }
+    
+    fun stop() {
+        isPaused = false
+        itemsInFlight.set(0)
+        producerJob?.cancel()
+        consumerJob?.cancel()
+        sentenceChannel.cancel()
+        audioChannel.cancel()
+        audioTrack?.pause()
+        audioTrack?.flush()
+        
+        sentenceChannel = Channel(Channel.UNLIMITED)
+        audioChannel = Channel(capacity = 5)
     }
 
     private fun startPipelines() {
-        producerJob?.cancel()
-        consumerJob?.cancel()
-        audioChannel.cancel()
-        audioChannel = Channel(capacity = 5) // Buffer up to 5 sentences
-        
         producerJob = scope.launch {
-            while (currentSentenceIndex < sentenceQueue.size && isActive) {
-                val idx = currentSentenceIndex
-                val sentence = sentenceQueue[idx]
-                val ttsInstance = tts ?: break
-                
+            for (sentence in sentenceChannel) {
+                if (!isActive) break
                 Log.d("TTSManager", "Generating audio for: $sentence")
                 try {
+                    val ttsInstance = tts ?: break
                     val audio = ttsInstance.generate(sentence, sid = currentSid, speed = 1.0f)
                     if (isActive) {
-                        audioChannel.send(AudioTask(idx, audio.samples, audio.sampleRate))
-                        currentSentenceIndex++
+                        audioChannel.send(AudioTask(0, audio.samples, audio.sampleRate))
+                    } else {
+                        checkQueueFinished()
                     }
                 } catch (e: Exception) {
                     Log.e("TTSManager", "Error generating TTS: ${e.message}")
-                    currentSentenceIndex++
+                    checkQueueFinished()
                 }
             }
-            audioChannel.close()
         }
         
         consumerJob = scope.launch {
-            // Prevent initial stutter by buffering up to 2 sentences (or all sentences if < 2) before playback begins
-            while (isActive && currentSentenceIndex < 2 && currentSentenceIndex < sentenceQueue.size) {
-                kotlinx.coroutines.delay(50)
-            }
-            
             for (task in audioChannel) {
                 if (!isActive) break
-                currentlyPlayingIndex = task.index
                 
                 val sampleRate = task.sampleRate
                 if (audioTrack == null || audioTrack?.sampleRate != sampleRate) {
                     audioTrack?.release()
                     audioTrack = AudioTrack.Builder()
                         .setAudioAttributes(AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
                             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                             .build())
                         .setAudioFormat(AudioFormat.Builder()
-                            .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                             .setSampleRate(sampleRate)
                             .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                             .build())
                         .setTransferMode(AudioTrack.MODE_STREAM)
-                        .setBufferSizeInBytes(AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_FLOAT) * 2)
+                        .setBufferSizeInBytes(AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT) * 2)
                         .build()
                 }
 
@@ -195,16 +210,27 @@ class TTSManager(private val context: Context, private val onQueueFinished: () -
                 
                 try {
                     track.play()
-                    track.write(task.samples, 0, task.samples.size, AudioTrack.WRITE_BLOCKING)
+                    val shortSamples = ShortArray(task.samples.size)
+                    for (i in task.samples.indices) {
+                        val f = task.samples[i].coerceIn(-1.0f, 1.0f)
+                        shortSamples[i] = (f * 32767.0f).toInt().toShort()
+                    }
+                    track.write(shortSamples, 0, shortSamples.size, AudioTrack.WRITE_BLOCKING)
                 } catch (e: Exception) {
                     Log.e("TTSManager", "Error playing track: ${e.message}")
                 }
+                
+                checkQueueFinished()
             }
-            
-            if (isActive) {
-                withContext(Dispatchers.Main) {
-                    onQueueFinished()
-                }
+        }
+    }
+    
+    private suspend fun checkQueueFinished() {
+        val remaining = itemsInFlight.decrementAndGet()
+        if (remaining <= 0) {
+            itemsInFlight.set(0)
+            withContext(Dispatchers.Main) {
+                onQueueFinished()
             }
         }
     }
@@ -231,19 +257,23 @@ class TTSManager(private val context: Context, private val onQueueFinished: () -
         if (isPaused) {
             isPaused = false
         }
-        audioTrack?.flush()
         audioTrack?.pause()
-        currentSentenceIndex = currentlyPlayingIndex + 1
-        startPipelines()
+        audioTrack?.flush()
+        audioTrack?.play()
+        checkQueueFinishedSynchronous()
+    }
+    
+    private fun checkQueueFinishedSynchronous() {
+        val remaining = itemsInFlight.decrementAndGet()
+        if (remaining <= 0) {
+            itemsInFlight.set(0)
+            // Can't easily jump to Main thread without coroutine scope here, but skip is rare.
+            // Best effort fallback
+            onQueueFinished()
+        }
     }
     
     fun release() {
-        producerJob?.cancel()
-        consumerJob?.cancel()
-        audioChannel.cancel()
-        audioTrack?.release()
-        audioTrack = null
-        tts?.release()
-        tts = null
+        stop()
     }
 }

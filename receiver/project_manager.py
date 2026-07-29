@@ -36,6 +36,7 @@ class ProjectManager:
         # Step 1: Load all projects and build a path -> project_name lookup
         projects = []
         path_to_project = {}  # normalized_path -> project_name
+        id_to_project = {}    # project_id -> project_name
         for f in project_files:
             try:
                 with open(f, 'r', encoding='utf-8') as file:
@@ -61,7 +62,10 @@ class ProjectManager:
                             "folderName": folder_name,
                             "_json_mtime": os.path.getmtime(f),
                         })
-                        # Build path lookup for DB matching
+                        # Build lookup for DB matching
+                        if proj_id:
+                            id_to_project[proj_id] = name
+                            
                         if folder_uri:
                             decoded = urllib.parse.unquote(folder_uri)
                             if decoded.startswith('file:///'):
@@ -109,6 +113,13 @@ class ProjectManager:
                                 if best_match:
                                     conv_to_project[conv_id] = best_match
                                     break
+                                    
+                        # Also extract UUIDs and check if they match any project ID
+                        uuids = re.findall(rb'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', row[0])
+                        for uuid_bytes in uuids:
+                            uuid_str = uuid_bytes.decode('utf-8')
+                            if uuid_str in id_to_project:
+                                conv_to_project[conv_id] = id_to_project[uuid_str]
                 except Exception:
                     continue
 
@@ -141,27 +152,33 @@ class ProjectManager:
                 continue
 
         # Step 4: Apply timestamps and sort
+        # Sort: Projects with conversations (most recent first) -> Projects without conversations (by file mtime)
         for p in projects:
-            p['_last_user_chat'] = project_last_user.get(p['name'], "")
+            p['lastActive'] = project_last_user.get(p['name'], "")
+            p['is_recent'] = bool(p['lastActive'])
 
-        projects.sort(key=lambda x: (x.get('_last_user_chat', ""), x.get('_json_mtime', 0)), reverse=True)
+        projects.sort(key=lambda x: (
+            1 if x["is_recent"] else 0,
+            x["lastActive"] if x["is_recent"] else x.get("_json_mtime", 0)
+        ), reverse=True)
 
         # Clean up internal fields before returning
         for p in projects:
-            p.pop('_last_user_chat', None)
+            p.pop('lastActive', None)
+            p.pop('is_recent', None)
             p.pop('_json_mtime', None)
 
         return projects
 
-    def find_conversations_for_project(self, folder_name: str) -> list[dict]:
+    def find_conversations_for_project(self, folder_name: str, project_id: str = None) -> list[dict]:
         """Find conversations belonging to a project using authoritative DB metadata.
         Returns list of {id, lastActive, firstMessage} dicts, sorted by recency."""
-        if not folder_name or not os.path.isdir(self.brain_dir):
+        if (not folder_name and not project_id) or not os.path.isdir(self.brain_dir):
             return []
 
         # Build the target path pattern from the folder name
         # folder_name is like "Tether", "Curator", etc.
-        target_lower = folder_name.lower()
+        target_lower = folder_name.lower() if folder_name else None
 
         # Scan conversation DBs for matching workspace URIs
         matching_convs = []  # (conv_id, transcript_path, mtime)
@@ -181,18 +198,30 @@ class ProjectManager:
                     row = cursor.fetchone()
                     conn.close()
                     if row and isinstance(row[0], bytes):
-                        uris = re.findall(rb'file:///[a-zA-Z]:/[^\x00-\x1f\x80-\x9f]+', row[0])
-                        for uri_bytes in uris:
-                            uri_str = uri_bytes.decode('utf-8', errors='replace')
-                            m = re.match(r'file:///[a-zA-Z]:/[^"\x00-\x1f]*', uri_str)
-                            if m:
-                                path = m.group(0)[8:]  # strip file:///
-                                # Check if this conversation's workspace ends with the target folder
-                                path_parts = path.rstrip('/').lower().split('/')
-                                if path_parts and path_parts[-1] == target_lower:
-                                    mtime = os.path.getmtime(transcript)
-                                    matching_convs.append((conv_id, transcript, mtime))
+                        matched = False
+                        if target_lower:
+                            uris = re.findall(rb'file:///[a-zA-Z]:/[^\x00-\x1f\x80-\x9f]+', row[0])
+                            for uri_bytes in uris:
+                                uri_str = uri_bytes.decode('utf-8', errors='replace')
+                                m = re.match(r'file:///[a-zA-Z]:/[^"\x00-\x1f]*', uri_str)
+                                if m:
+                                    path = m.group(0)[8:]  # strip file:///
+                                    # Check if this conversation's workspace ends with the target folder
+                                    path_parts = path.rstrip('/').lower().split('/')
+                                    if path_parts and path_parts[-1] == target_lower:
+                                        matched = True
+                                        break
+                                        
+                        if not matched and project_id:
+                            uuids = re.findall(rb'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', row[0])
+                            for uuid_bytes in uuids:
+                                if uuid_bytes.decode('utf-8') == project_id:
+                                    matched = True
                                     break
+                                    
+                        if matched:
+                            mtime = os.path.getmtime(transcript)
+                            matching_convs.append((conv_id, transcript, mtime))
                 except Exception:
                     continue
 

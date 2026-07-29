@@ -15,7 +15,6 @@ import androidx.activity.compose.setContent
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.activity.result.PickVisualMediaRequest
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.Base64
@@ -83,80 +82,6 @@ data class ArtifactMessage(val title: String, val content: String)
 data class RoverHost(val name: String, val ip: String, val port: Int, val os: String = "")
 data class ApprovalRequest(val title: String, val options: List<String>)
 
-class NsdDiscoveryManager(context: Context) {
-    private val nsdManager = context.getSystemService(Context.NSD_SERVICE) as NsdManager
-    private val serviceType = "_rover._tcp."
-    
-    private val _hosts = MutableStateFlow<List<RoverHost>>(emptyList())
-    val hosts: StateFlow<List<RoverHost>> = _hosts
-    
-    private var discoveryListener: NsdManager.DiscoveryListener? = null
-    
-    fun startDiscovery() {
-        if (discoveryListener != null) return
-        
-        discoveryListener = object : NsdManager.DiscoveryListener {
-            override fun onDiscoveryStarted(regType: String) {}
-            override fun onServiceFound(service: NsdServiceInfo) {
-                if (service.serviceType == serviceType || service.serviceType == "_rover._tcp.local.") {
-                    nsdManager.resolveService(service, object : NsdManager.ResolveListener {
-                        override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {}
-                        override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
-                            val hostName = serviceInfo.serviceName
-                            val ip = serviceInfo.host.hostAddress ?: return
-                            val port = serviceInfo.port
-                            
-                            var os = ""
-                            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
-                                val osBytes = serviceInfo.attributes["os"]
-                                if (osBytes != null) {
-                                    os = String(osBytes, Charsets.UTF_8)
-                                }
-                            }
-                            
-                            val host = RoverHost(hostName, ip, port, os)
-                            _hosts.update { current ->
-                                if (current.none { it.name == host.name }) {
-                                    val newList = current + host
-                                    ConnectionRepository.updateDiscoveredHosts(newList)
-                                    newList
-                                } else current
-                            }
-                        }
-                    })
-                }
-            }
-            override fun onServiceLost(service: NsdServiceInfo) {
-                val hostName = service.serviceName
-                _hosts.update { current ->
-                    val newList = current.filterNot { it.name == hostName }
-                    ConnectionRepository.updateDiscoveredHosts(newList)
-                    newList
-                }
-            }
-            override fun onDiscoveryStopped(serviceType: String) {}
-            override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
-                nsdManager.stopServiceDiscovery(this)
-            }
-            override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {}
-        }
-        
-        try {
-            nsdManager.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD, discoveryListener)
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-    }
-    
-    fun stopDiscovery() {
-        discoveryListener?.let {
-            try {
-                nsdManager.stopServiceDiscovery(it)
-            } catch (e: Exception) {}
-        }
-        discoveryListener = null
-    }
-}
 
 class MainActivity : androidx.fragment.app.FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -169,11 +94,28 @@ class MainActivity : androidx.fragment.app.FragmentActivity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             permissions.add(Manifest.permission.POST_NOTIFICATIONS)
         }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+        }
         val ungranted = permissions.filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
         if (ungranted.isNotEmpty()) {
             requestPermissions(ungranted.toTypedArray(), 101)
+        } else {
+            startRoverService()
         }
 
+        // Auto-start Tailscale if it was already authenticated previously
+        // TailscaleManager.start(this)
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 101) {
+            startRoverService()
+        }
+    }
+
+    private fun startRoverService() {
         // Start the background service
         val serviceIntent = Intent(this, RoverService::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -181,10 +123,7 @@ class MainActivity : androidx.fragment.app.FragmentActivity() {
         } else {
             startService(serviceIntent)
         }
-        
-        val nsdManager = NsdDiscoveryManager(this)
-        nsdManager.startDiscovery()
-        
+
         // Auto-start Tailscale if it was already authenticated previously
         // TailscaleManager.start(this)
 
@@ -276,14 +215,14 @@ fun RemoteControlScreen() {
     val context = LocalContext.current
     
     val photoPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.PickVisualMedia()
+        contract = ActivityResultContracts.GetContent()
     ) { uri ->
         if (uri != null && connectionStatus == "Connected") {
             scope.launch(Dispatchers.IO) {
                 try {
-                    val inputStream = context.contentResolver.openInputStream(uri)
-                    val bitmap = BitmapFactory.decodeStream(inputStream)
-                    inputStream?.close()
+                    val bitmap = context.contentResolver.openInputStream(uri)?.use { inputStream ->
+                        BitmapFactory.decodeStream(inputStream)
+                    }
                     
                     if (bitmap != null) {
                         val maxDim = 1024f
@@ -534,51 +473,6 @@ fun RemoteControlScreen() {
                     }
                 }
                 
-                val availableConversations = state.availableConversations
-                if (availableConversations.isNotEmpty()) {
-                    HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
-                    Text("Active Agents", modifier = Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.titleMedium)
-                    HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
-                    
-                    val orderedList = mutableListOf<Pair<ConversationInfo, Int>>()
-                    fun addNode(node: ConversationInfo, depth: Int) {
-                        orderedList.add(node to depth)
-                        availableConversations.filter { it.parentId == node.id }.forEach { addNode(it, depth + 1) }
-                    }
-                    availableConversations.filter { it.parentId.isEmpty() }.forEach { addNode(it, 0) }
-                    val addedIds = orderedList.map { it.first.id }.toSet()
-                    availableConversations.filter { it.id !in addedIds }.forEach { orderedList.add(it to 0) }
-
-                    orderedList.forEach { (conv, depth) ->
-                        val horizontalPad = 12 + (depth * 24)
-                        NavigationDrawerItem(
-                            label = { 
-                                Column {
-                                    val isSubagent = depth > 0
-                                    val prefix = if (isSubagent) "↳ " else ""
-                                    Text(prefix + conv.id.take(8) + "...", style = MaterialTheme.typography.labelMedium)
-                                    Text(
-                                        conv.firstMessage, 
-                                        style = MaterialTheme.typography.bodySmall, 
-                                        color = TextSecondary,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                }
-                            },
-                            selected = (conv.id == state.activeConversationId),
-                            onClick = {
-                                val payload = org.json.JSONObject().apply {
-                                    put("event", "select_conversation")
-                                    put("conversationId", conv.id)
-                                }
-                                ConnectionRepository.webSocketManager?.send(payload.toString())
-                                scope.launch { drawerState.close() }
-                            },
-                            modifier = Modifier.padding(start = horizontalPad.dp, end = 12.dp)
-                        )
-                    }
-                }
 
                 HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
                 NavigationDrawerItem(
@@ -1409,7 +1303,11 @@ fun RemoteControlScreen() {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         IconButton(onClick = {
-                            photoPickerLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                            try {
+                                photoPickerLauncher.launch("image/*")
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                            }
                         }) {
                             Icon(Icons.Default.Add, contentDescription = "Attach Image")
                         }
@@ -1561,10 +1459,12 @@ fun RemoteControlScreen() {
                                 }
                                 
                                 val backspacesNeeded = oldText.length - commonPrefixLength
-                                for (i in 0 until backspacesNeeded) {
-                                    if (connectionStatus == "Connected") {
-                                        webSocketManager?.send(JSONObject().apply { put("event", "keyboard_input"); put("key", "Backspace") }.toString())
-                                    }
+                                if (backspacesNeeded > 0 && connectionStatus == "Connected") {
+                                    webSocketManager?.send(JSONObject().apply { 
+                                        put("event", "keyboard_input_batch")
+                                        put("key", "Backspace")
+                                        put("count", backspacesNeeded)
+                                    }.toString())
                                 }
                                 
                                 val added = newText.substring(commonPrefixLength)
@@ -1611,6 +1511,9 @@ fun RemoteControlScreen() {
                                             
                                             val pointerId = down.id
                                             var totalDrag = Offset.Zero
+                                            var accumulatedDx = 0f
+                                            var accumulatedDy = 0f
+                                            var lastSendTime = 0L
                                             
                                             do {
                                                 val event = awaitPointerEvent()
@@ -1626,16 +1529,37 @@ fun RemoteControlScreen() {
                                                             if (!dragTriggered) dragTriggered = true
                                                             dragChange.consume()
                                                             
-                                                            if (connectionStatus == "Connected") {
-                                                                webSocketManager?.send(JSONObject().apply {
-                                                                    put("event", "mouse_move")
-                                                                    put("dx", positionChange.x.toDouble())
-                                                                    put("dy", positionChange.y.toDouble())
-                                                                }.toString())
+                                                            accumulatedDx += positionChange.x
+                                                            accumulatedDy += positionChange.y
+                                                            
+                                                            val currentTime = System.currentTimeMillis()
+                                                            if (currentTime - lastSendTime > 16) {
+                                                                if (connectionStatus == "Connected") {
+                                                                    webSocketManager?.send(JSONObject().apply {
+                                                                        put("event", "mouse_move")
+                                                                        put("dx", accumulatedDx.toDouble())
+                                                                        put("dy", accumulatedDy.toDouble())
+                                                                    }.toString())
+                                                                }
+                                                                accumulatedDx = 0f
+                                                                accumulatedDy = 0f
+                                                                lastSendTime = currentTime
                                                             }
                                                         }
                                                     } else {
                                                         longPressJob.cancel()
+                                                        
+                                                        // Send any remaining accumulated movement before processing click/up
+                                                        if (accumulatedDx != 0f || accumulatedDy != 0f) {
+                                                            if (connectionStatus == "Connected") {
+                                                                webSocketManager?.send(JSONObject().apply {
+                                                                    put("event", "mouse_move")
+                                                                    put("dx", accumulatedDx.toDouble())
+                                                                    put("dy", accumulatedDy.toDouble())
+                                                                }.toString())
+                                                            }
+                                                        }
+                                                        
                                                         if (!dragTriggered && !isLongPress) {
                                                             if (connectionStatus == "Connected") {
                                                                 webSocketManager?.send(JSONObject().apply { put("event", "mouse_click"); put("button", "left") }.toString())
@@ -1660,29 +1584,28 @@ fun RemoteControlScreen() {
 
 class WebSocketManager {
     private var webSocket: WebSocket? = null
-    private var client: OkHttpClient = OkHttpClient()
+    private val client: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+        .writeTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+        .pingInterval(15, java.util.concurrent.TimeUnit.SECONDS)
+        .build()
 
     fun connect(url: String, listener: WebSocketListener) {
         disconnect()
         
-        val builder = OkHttpClient.Builder()
-            .connectTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
-            .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
-            .writeTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
-            .pingInterval(15, java.util.concurrent.TimeUnit.SECONDS)
-
         var finalUrl = url
         if (url.contains(":8765") || url.contains("100.")) {
             try {
                 val hostPort = url.substringAfter("://").substringBefore("/")
-                tsnet_wrapper.Tsnet_wrapper.setProxyTarget(hostPort)
+                synchronized(WebSocketManager::class.java) {
+                    tsnet_wrapper.Tsnet_wrapper.setProxyTarget(hostPort)
+                }
                 finalUrl = url.replace(hostPort, "127.0.0.1:1080")
             } catch (e: Exception) {
                 e.printStackTrace()
             }
         }
-
-        client = builder.build()
         
         val request = Request.Builder().url(finalUrl).build()
         webSocket = client.newWebSocket(request, listener)

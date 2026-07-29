@@ -127,11 +127,14 @@ object ConnectionRepository {
         }
     }
 
-    fun setActiveConversation(conversationId: String, preview: String) {
+    fun setActiveConversation(conversationId: String, preview: String): Boolean {
+        if (_state.value.activeConversationId == conversationId) return false
         _state.update { it.copy(
             activeConversationId = conversationId,
-            activeConversationPreview = preview
+            activeConversationPreview = preview,
+            chatMessages = emptyList()
         ) }
+        return true
     }
 
     fun setAvailableConversations(conversations: List<ConversationInfo>) {

@@ -35,8 +35,11 @@ class WebSocketServer:
         payload = json.dumps(msg_dict)
         print(f"[DEBUG] Sending payload to {len(self.state.connected_clients)} clients. Payload starts with: {payload[:50]}", flush=True)
         tasks = [asyncio.create_task(client.send(payload)) for client in self.state.connected_clients]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        print(f"[DEBUG] Broadcast results: {results}", flush=True)
+        try:
+            results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5.0)
+            print(f"[DEBUG] Broadcast results: {results}", flush=True)
+        except asyncio.TimeoutError:
+            print("[DEBUG] Broadcast timed out", flush=True)
 
     async def process_transcript_entry(self, data):
         """Process a single transcript entry and broadcast relevant events."""
@@ -187,6 +190,10 @@ class WebSocketServer:
         # Start queue monitor
         if self.queue_monitor_task and not self.queue_monitor_task.done():
             self.queue_monitor_task.cancel()
+            try:
+                await self.queue_monitor_task
+            except asyncio.CancelledError:
+                pass
         
         async def on_state_change(state_data):
             await self.broadcast({"type": "queue_update", "messages": state_data.get("messages", [])})
@@ -253,7 +260,7 @@ class WebSocketServer:
                 try:
                     try:
                         data = json.loads(message)
-                    except (json.JSONDecodeError, UnicodeDecodeError):
+                    except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
                         print("Error: Malformed JSON payload received", file=sys.stderr)
                         continue
 
@@ -282,12 +289,10 @@ class WebSocketServer:
                             continue
 
                         folder_name = project.get("folderName", "")
-                        if not folder_name:
-                            print(f"Error: Project '{project_name}' has no folder URI", file=sys.stderr)
-                            continue
+                        project_id = project.get("id", "")
 
                         # Find matching conversations
-                        convos = self.project_manager.find_conversations_for_project(folder_name)
+                        convos = self.project_manager.find_conversations_for_project(folder_name, project_id)
 
                         if convos:
                             # Auto-select most recent main conversation (not a subagent)
@@ -340,9 +345,10 @@ class WebSocketServer:
                         
                         # 1. Create the directory on disk
                         import os
-                        dev_dir = r"C:\Development"
+                        import config
+                        dev_dir = config.get_dev_directory()
                         project_path = os.path.join(dev_dir, project_name)
-                        os.makedirs(project_path, exist_ok=True)
+                        await asyncio.to_thread(os.makedirs, project_path, exist_ok=True)
                         print(f"[CREATE_PROJECT] Directory created: {project_path}", flush=True)
                         
                         # 2. Use CDP to create the project in Antigravity's UI
@@ -366,6 +372,8 @@ class WebSocketServer:
                                     self.state.active_conversation_id = None
                                     print(f"[CREATE_PROJECT] No section ID found, cleared active conversation", flush=True)
                                 self.state.update()
+                                
+                                await self.restart_tailer()
                                 
                                 await self.broadcast({
                                     "type": "project_selected",
@@ -414,11 +422,25 @@ class WebSocketServer:
                             self.state.active_conversation_id = conv_id
                             print(f"[SELECT_CONVERSATION] {conv_id[:12]}...", flush=True)
                             await self.restart_tailer()
+                            
+                            first_msg = ""
+                            if self.state.active_project_name:
+                                projects = self.project_manager.get_projects_with_details()
+                                project = next((p for p in projects if p["name"] == self.state.active_project_name), None)
+                                if project:
+                                    convos = self.project_manager.find_conversations_for_project(
+                                        project.get("folderName", ""), 
+                                        project.get("id", "")
+                                    )
+                                    selected = next((c for c in convos if c["id"] == conv_id), None)
+                                    if selected:
+                                        first_msg = selected.get("firstMessage", "")
+                                        
                             await self.broadcast({
                                 "type": "project_selected",
                                 "project": self.state.active_project_name or "",
                                 "conversationId": self.state.active_conversation_id,
-                                "firstMessage": ""
+                                "firstMessage": first_msg
                             })
                             
                     # ─── Model Selection ───
@@ -509,7 +531,7 @@ class WebSocketServer:
                         if base64_data:
                             print("[IMAGE] Received image payload", flush=True)
                             if not mock and self.state.active_conversation_id:
-                                filepath = self.save_image_to_conversation(base64_data, self.state.active_conversation_id)
+                                filepath = await asyncio.to_thread(self.save_image_to_conversation, base64_data, self.state.active_conversation_id)
                                 if filepath:
                                     # Inject a chat message referencing the saved image via CDP
                                     content = f"[Image attached: {filepath}]"
@@ -558,7 +580,6 @@ class WebSocketServer:
                         if not mock:
                             try:
                                 # Force port rediscovery to ensure freshness
-                                import asyncio
                                 await asyncio.to_thread(self.cdp_client.discover_port)
                                 print(f"[APPROVE] CDP port: {self.cdp_client._cdp_port}", flush=True)
                                 

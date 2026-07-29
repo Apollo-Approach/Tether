@@ -40,6 +40,22 @@ import os
 from functools import partial
 from zeroconf import ServiceInfo
 from zeroconf.asyncio import AsyncZeroconf
+import ctypes
+
+def disable_quickedit():
+    """Disable Windows Console QuickEdit mode to prevent the process from pausing when clicked."""
+    if os.name == 'nt':
+        try:
+            kernel32 = ctypes.windll.kernel32
+            hStdIn = kernel32.GetStdHandle(-10)
+            mode = ctypes.c_uint32()
+            kernel32.GetConsoleMode(hStdIn, ctypes.byref(mode))
+            new_mode = (mode.value & ~0x0040) | 0x0080
+            kernel32.SetConsoleMode(hStdIn, new_mode)
+        except Exception:
+            pass
+
+disable_quickedit()
 
 # ─── Local Modules ───
 from project_manager import ProjectManager
@@ -64,30 +80,66 @@ class AppState:
         self.cdp_port = None
         self.on_change = None
         self.logs = []
+        self.new_logs = []
+        self.log_lock = threading.Lock()
         self.tailscale_auth_url = None
         self.tailscale_ip = None
         self.proxy_proc = None
+        self.server_error = None
 
     def update(self):
         if self.on_change:
             self.on_change()
 
     def log(self, message):
-        self.logs.append(message)
-        if len(self.logs) > 500:
-            self.logs.pop(0)
+        with self.log_lock:
+            self.logs.append(message)
+            self.new_logs.append(message)
+            if len(self.logs) > 500:
+                self.logs.pop(0)
         self.update()
 
 state = AppState()
 
-import builtins
-_original_print = builtins.print
-def _ui_print(*args, **kwargs):
-    _original_print(*args, **kwargs)
-    if 'file' not in kwargs or kwargs['file'] in (sys.stdout, sys.stderr):
-        msg = " ".join(str(a) for a in args)
-        state.log(msg)
-builtins.print = _ui_print
+class OutputLogger:
+    def __init__(self, stream, prefix=""):
+        self.stream = stream
+        self.prefix = prefix
+        self._is_logging = False
+    def write(self, message):
+        if self.stream and hasattr(self.stream, 'write'):
+            try:
+                self.stream.write(message)
+            except Exception:
+                pass
+        if message.strip() and not self._is_logging:
+            self._is_logging = True
+            try:
+                state.log(f"{self.prefix}{message.strip()}")
+            finally:
+                self._is_logging = False
+    def flush(self):
+        if self.stream and hasattr(self.stream, 'flush'):
+            try:
+                self.stream.flush()
+            except Exception:
+                pass
+    def reconfigure(self, **kwargs):
+        if self.stream and hasattr(self.stream, 'reconfigure'):
+            try:
+                self.stream.reconfigure(**kwargs)
+            except Exception:
+                pass
+
+sys.stderr = OutputLogger(sys.stderr, "ERROR: ")
+sys.stdout = OutputLogger(sys.stdout, "")
+
+def handle_exception(exc_type, exc_value, exc_traceback):
+    import traceback
+    msg = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    state.log(f"CRASH: {msg}")
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+sys.excepthook = handle_exception
 
 
 # ─── Module Instances ───
@@ -118,83 +170,124 @@ async def run_server(args):
     print(f"Looking for Tailscale proxy at: {proxy_path}", flush=True)
     if os.path.exists(proxy_path):
         def run_proxy():
-            try:
-                state.proxy_proc = subprocess.Popen(
-                    [proxy_path],
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, bufsize=1
-                )
-                for line in state.proxy_proc.stdout:
-                    line = line.strip()
-                    if "TAILSCALE_AUTH_URL:" in line:
-                        url = line.split("TAILSCALE_AUTH_URL:")[1].strip()
-                        state.tailscale_auth_url = url
-                        state.update()
-                        print("\\n" + "=" * 60, flush=True)
-                        print("🔑 ACTION REQUIRED: Tailscale Remote Access Authentication", flush=True)
-                        print("Please visit the following URL to authenticate your PC:", flush=True)
-                        print(url, flush=True)
-                        print("=" * 60 + "\\n", flush=True)
-                    elif "TAILSCALE_IP:" in line:
-                        ip = line.split("TAILSCALE_IP:")[1].strip()
-                        state.tailscale_ip = ip
-                        state.tailscale_auth_url = None
-                        state.update()
-                        print(f"✅ Tailscale proxy connected! IP: {ip}", flush=True)
-            except Exception as e:
-                print(f"Failed to run proxy: {e}", file=sys.stderr)
+            while True:
+                try:
+                    state.proxy_proc = subprocess.Popen(
+                        [proxy_path],
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        text=True, bufsize=1
+                    )
+                    for line in state.proxy_proc.stdout:
+                        line = line.strip()
+                        if "TAILSCALE_AUTH_URL:" in line:
+                            url = line.split("TAILSCALE_AUTH_URL:")[1].strip()
+                            state.tailscale_auth_url = url
+                            state.update()
+                            print("\\n" + "=" * 60, flush=True)
+                            print("🔑 ACTION REQUIRED: Tailscale Remote Access Authentication", flush=True)
+                            print("Please visit the following URL to authenticate your PC:", flush=True)
+                            print(url, flush=True)
+                            print("=" * 60 + "\\n", flush=True)
+                        elif "TAILSCALE_IP:" in line:
+                            ip = line.split("TAILSCALE_IP:")[1].strip()
+                            state.tailscale_ip = ip
+                            state.tailscale_auth_url = None
+                            state.update()
+                            print(f"✅ Tailscale proxy connected! IP: {ip}", flush=True)
+                    state.proxy_proc.wait()
+                    print(f"Proxy exited with code {state.proxy_proc.returncode}. Restarting in 5s...", file=sys.stderr)
+                except Exception as e:
+                    print(f"Failed to run proxy: {e}. Restarting in 5s...", file=sys.stderr)
+                import time
+                time.sleep(5)
 
         threading.Thread(target=run_proxy, daemon=True).start()
 
-    async with websockets.serve(
-        partial(ws_server.handle_client, mock=args.mock), args.host, args.port
-    ) as server:
-        actual_port = server.sockets[0].getsockname()[1]
-        print(f"Server listening on ws://{args.host}:{actual_port}", flush=True)
+    try:
+        async with websockets.serve(
+            partial(ws_server.handle_client, mock=args.mock), args.host, args.port
+        ) as server:
+            actual_port = server.sockets[0].getsockname()[1]
+            print(f"Server listening on ws://{args.host}:{actual_port}", flush=True)
 
-        # Register mDNS service
-        aiozc = AsyncZeroconf()
-        hostname = socket.gethostname()
-        try:
-            local_ips = [
-                ip for ip in socket.gethostbyname_ex(hostname)[2]
-                if not ip.startswith("127.") and not ip.startswith("169.254.")
-            ]
-            if not local_ips:
+            # Register mDNS service
+            aiozc = AsyncZeroconf()
+            hostname = socket.gethostname()
+            try:
+                local_ips = [
+                    ip for ip in socket.gethostbyname_ex(hostname)[2]
+                    if not ip.startswith("127.") and not ip.startswith("169.254.")
+                ]
+                if not local_ips:
+                    local_ips = ['127.0.0.1']
+            except Exception:
                 local_ips = ['127.0.0.1']
-        except Exception:
-            local_ips = ['127.0.0.1']
 
-        info = ServiceInfo(
-            "_rover._tcp.local.",
-            f"{hostname}._rover._tcp.local.",
-            addresses=[socket.inet_aton(ip) for ip in local_ips],
-            port=actual_port,
-            properties={
-                'app': 'rover',
-                'hostname': hostname,
-                'os': platform.system(),
-                'version': '2.0.0'
-            },
-            server=f"{hostname}.local.",
-        )
-        await aiozc.async_register_service(info)
-        print(f"Registered mDNS service as {info.name} at {local_ips[0]}:{actual_port}", flush=True)
+            info = ServiceInfo(
+                "_rover._tcp.local.",
+                f"{hostname}._rover._tcp.local.",
+                addresses=[socket.inet_aton(ip) for ip in local_ips],
+                port=actual_port,
+                properties={
+                    'app': 'rover',
+                    'hostname': hostname,
+                    'os': platform.system(),
+                    'version': '2.0.0'
+                },
+                server=f"{hostname}.local.",
+            )
+            await aiozc.async_register_service(info)
+            print(f"Registered mDNS service as {info.name} at {local_ips[0]}:{actual_port}", flush=True)
 
-        # Print startup summary
-        projects = project_manager.get_projects_with_details()
-        print(f"Discovered {len(projects)} projects", flush=True)
-        print(f"Brain directory: {BRAIN_DIR}", flush=True)
-        print("Waiting for client to select a project...", flush=True)
+            class UdpDiscoveryProtocol(asyncio.DatagramProtocol):
+                def connection_made(self, transport):
+                    self.transport = transport
+                def datagram_received(self, data, addr):
+                    try:
+                        message = data.decode('utf-8')
+                        if message == "ROVER_DISCOVER":
+                            response = json.dumps({
+                                "app": "rover",
+                                "hostname": hostname,
+                                "port": actual_port
+                            }).encode('utf-8')
+                            self.transport.sendto(response, addr)
+                            print(f"[UDP] Replied to discovery from {addr}", flush=True)
+                    except Exception:
+                        pass
 
-        try:
-            await asyncio.Future()  # run forever
-        finally:
-            await aiozc.async_unregister_service(info)
-            await aiozc.async_close()
+            loop = asyncio.get_running_loop()
+            try:
+                udp_transport, udp_protocol = await loop.create_datagram_endpoint(
+                    lambda: UdpDiscoveryProtocol(),
+                    local_addr=('0.0.0.0', 42839)
+                )
+                print("[UDP] Listening for discovery broadcasts on port 42839", flush=True)
+            except Exception as e:
+                print(f"[UDP] Failed to start UDP listener: {e}", file=sys.stderr)
+                udp_transport = None
+
+            # Print startup summary
+            projects = project_manager.get_projects_with_details()
+            print(f"Discovered {len(projects)} projects", flush=True)
+            print(f"Brain directory: {BRAIN_DIR}", flush=True)
+            print("Waiting for client to select a project...", flush=True)
+
+            try:
+                await asyncio.Future()  # run forever
+            finally:
+                if udp_transport:
+                    udp_transport.close()
+                await aiozc.async_unregister_service(info)
+                await aiozc.async_close()
+    except OSError as e:
+        state.server_error = str(e)
+        print(f"Failed to start server: {e}", file=sys.stderr)
+        state.update()
 
 
 async def flet_main(page: ft.Page):
+    loop = asyncio.get_running_loop()
     page.title = "Tether Receiver"
     page.theme_mode = ft.ThemeMode.DARK
     page.theme = ft.Theme(color_scheme_seed="#F59E0B")  # Warm Amber
@@ -226,14 +319,17 @@ async def flet_main(page: ft.Page):
     )
 
     async def open_dir_picker(e):
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
-        path = filedialog.askdirectory(
-            title="Select Development Directory",
-            initialdir=dev_dir_field.value
-        )
-        root.destroy()
+        def _ask_dir():
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes('-topmost', True)
+            res = filedialog.askdirectory(initialdir=dev_dir_field.value, title="Select Development Directory")
+            root.destroy()
+            return res
+
+        path = await asyncio.to_thread(_ask_dir)
         if path:
             dev_dir_field.value = path
             page.update()
@@ -282,31 +378,48 @@ async def flet_main(page: ft.Page):
         page.show_dialog(settings_dialog)
 
     def on_state_change():
-        # Update Status
-        if state.tailscale_ip:
-            status_text.value = f"Tailscale IP: {state.tailscale_ip}"
-            auth_url_banner.visible = False
-        elif state.tailscale_auth_url:
-            status_text.value = "Tailscale Auth Required"
-            auth_url_banner.controls = [
-                ft.Text("Action Required: Tailscale Authentication", color=ft.Colors.ERROR, weight="bold"),
-                ft.Text(state.tailscale_auth_url, selectable=True)
-            ]
-            auth_url_banner.visible = True
-        else:
-            status_text.value = "Starting..."
+        def do_update():
+            # Update Status
+            if getattr(state, 'server_error', None):
+                status_text.value = f"Startup Failed: {state.server_error}"
+                status_text.color = ft.Colors.ERROR
+                auth_url_banner.visible = False
+            elif state.tailscale_ip:
+                status_text.value = f"Tailscale IP: {state.tailscale_ip}"
+                status_text.color = ft.Colors.AMBER
+                auth_url_banner.visible = False
+            elif state.tailscale_auth_url:
+                status_text.value = "Tailscale Auth Required"
+                status_text.color = ft.Colors.AMBER
+                auth_url_banner.controls = [
+                    ft.Text("Action Required: Tailscale Authentication", color=ft.Colors.ERROR, weight="bold"),
+                    ft.Text(state.tailscale_auth_url, selectable=True)
+                ]
+                auth_url_banner.visible = True
+            else:
+                status_text.value = "Starting..."
+                status_text.color = ft.Colors.AMBER
+                auth_url_banner.visible = False
 
-        # Update Active Context
-        clients_count.value = str(len(state.connected_clients))
-        project_name.value = state.active_project_name or "None"
-        conversation_id.value = state.active_conversation_id or "None"
-        
-        # Update Logs
-        logs_view.controls.clear()
-        for msg in state.logs[-50:]:  # Keep UI light by showing last 50
-            logs_view.controls.append(ft.Text(msg, size=12, font_family="Consolas"))
+            # Update Active Context
+            clients_count.value = str(len(state.connected_clients))
+            project_name.value = state.active_project_name or "None"
+            conversation_id.value = state.active_conversation_id or "None"
             
-        page.update()
+            # Update Logs
+            with state.log_lock:
+                for msg in state.new_logs:
+                    logs_view.controls.append(ft.Text(msg, size=12, font_family="Consolas"))
+                state.new_logs.clear()
+                if len(logs_view.controls) > 50:
+                    del logs_view.controls[:-50]
+                
+            page.update()
+        
+        try:
+            loop.call_soon_threadsafe(do_update)
+        except RuntimeError:
+            pass
 
     state.on_change = on_state_change
 
@@ -365,18 +478,28 @@ async def flet_main(page: ft.Page):
     )
 
     args = parse_args()
-    server_task = asyncio.create_task(run_server(args))
+    state.server_task = asyncio.create_task(run_server(args))
 
-    def on_window_event(e):
-        if e.data == "close":
+    async def on_window_event(e):
+        event_str = getattr(e, "data", "")
+        event_type = getattr(e, "type", None)
+        if event_str == "close" or event_type == "close" or (hasattr(ft, "WindowEventType") and event_type == ft.WindowEventType.CLOSE):
             if state.proxy_proc:
                 try:
-                    state.proxy_proc.terminate()
+                    if sys.platform == 'win32' or platform.system() == 'Windows':
+                        subprocess.call(['taskkill', '/F', '/T', '/PID', str(state.proxy_proc.pid)])
+                    else:
+                        state.proxy_proc.terminate()
                 except:
                     pass
-            server_task.cancel()
-            page.window.destroy()
-            os._exit(0)
+            if hasattr(page.window, "destroyAsync"):
+                await page.window.destroyAsync()
+            else:
+                import inspect
+                if inspect.iscoroutinefunction(page.window.destroy):
+                    await page.window.destroy()
+                else:
+                    page.window.destroy()
 
     page.window.prevent_close = True
     page.window.on_event = on_window_event

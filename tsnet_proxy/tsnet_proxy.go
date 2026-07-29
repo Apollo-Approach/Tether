@@ -6,10 +6,11 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/netip"
 	"os"
 	"path/filepath"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"tailscale.com/tsnet"
@@ -38,19 +39,14 @@ func main() {
 
 	// Capture the Auth URL to pass to the Python wrapper
 	s.UserLogf = func(format string, args ...any) {
-		msg := format
-		if len(args) > 0 {
-			if strArg, ok := args[0].(string); ok {
-				msg = strArg
-			} else {
-				msg = fmt.Sprintf(format, args...)
-			}
-		}
+		msg := fmt.Sprintf(format, args...)
 
 		if strings.Contains(msg, "https://login.tailscale.com/") {
 			// Extract just the URL using a simple split if possible, or just print the whole message
 			// The python side will parse it.
 			fmt.Printf("TAILSCALE_AUTH_URL: %s\n", msg)
+		} else {
+			log.Print(msg)
 		}
 	}
 
@@ -59,19 +55,23 @@ func main() {
 	}
 	defer s.Close()
 
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigc
+		log.Printf("Received termination signal, shutting down...")
+		s.Close()
+		os.Exit(0)
+	}()
+
 	// Wait for the node to be fully up and authenticated on the Tailnet
 	if _, err := s.Up(context.Background()); err != nil {
 		log.Fatalf("Failed to connect to tailnet: %v", err)
 	}
 
-	var ip4 netip.Addr
-	for i := 0; i < 20; i++ {
-		v4, _ := s.TailscaleIPs()
-		if v4.IsValid() {
-			ip4 = v4
-			break
-		}
-		time.Sleep(500 * time.Millisecond)
+	ip4, _ := s.TailscaleIPs()
+	if !ip4.IsValid() {
+		log.Fatalf("Failed to get valid Tailscale IP after Up")
 	}
 
 	fmt.Printf("TAILSCALE_IP: %v\n", ip4)
@@ -93,15 +93,38 @@ func main() {
 			continue
 		}
 
-		go handleConnection(clientConn)
+		go handleConnection(s, clientConn)
 	}
 }
 
-func handleConnection(clientConn net.Conn) {
+func handleConnection(s *tsnet.Server, clientConn net.Conn) {
 	defer clientConn.Close()
 
 	// Dial the local Python WebSocket server
-	localConn, err := net.Dial("tcp", "127.0.0.1:8080")
+	dialer := net.Dialer{
+		Timeout:   5 * time.Second,
+		KeepAlive: 3 * time.Minute,
+	}
+
+	// 1. WhoIs check
+	lc, err := s.LocalClient()
+	if err != nil {
+		log.Printf("Failed to get local client: %v", err)
+		return
+	}
+	who, err := lc.WhoIs(context.Background(), clientConn.RemoteAddr().String())
+	if err != nil {
+		log.Printf("WhoIs failed for %v: %v", clientConn.RemoteAddr(), err)
+		return
+	}
+	log.Printf("Connection accepted from tailscale user: %s", who.UserProfile.LoginName)
+
+	if tcpConn, ok := clientConn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(3 * time.Minute)
+	}
+
+	localConn, err := dialer.Dial("tcp", "127.0.0.1:8080")
 	if err != nil {
 		log.Printf("Failed to connect to local server: %v", err)
 		return
