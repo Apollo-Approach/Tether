@@ -1,11 +1,31 @@
 const { execSync } = require('child_process');
 
 const patterns = [
+    // AWS Access Key
     'AKIA[0-9A-Z]{16}',
+    
+    // Google / Gemini API Key
+    'AIza[0-9A-Za-z\\\\-_]{35}',
+    
+    // Tailscale Keys
+    'tskey-(?:auth|api)-[a-zA-Z0-9]+-[a-zA-Z0-9]+',
+    
+    // OpenAI Keys (Legacy & New proj formats)
     'sk-[a-zA-Z0-9]{48}',
+    'sk-proj-[a-zA-Z0-9\\\\-_]+',
+    
+    // Anthropic API Key
+    'sk-ant-api[0-9a-zA-Z\\\\-_]+',
+    
+    // GitHub Personal Access Token
     'ghp_[a-zA-Z0-9]{36}',
+    'github_pat_[a-zA-Z0-9]{22}_[a-zA-Z0-9]{59}',
+    
+    // Slack Tokens
     'xox[baprs]-[0-9]{12}-[0-9]{12}-[a-zA-Z0-9]{24}',
-    'AIza[0-9A-Za-z\\\\-_]{35}'
+    
+    // Generic Private Keys
+    '-----BEGIN [A-Z ]+PRIVATE KEY-----'
 ];
 
 try {
