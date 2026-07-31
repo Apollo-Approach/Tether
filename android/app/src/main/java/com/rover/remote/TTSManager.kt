@@ -122,7 +122,8 @@ class TTSManager(private val context: Context, private val onQueueFinished: () -
         // 4. Strip leftover markdown characters
         cleanText = cleanText.replace("*", "").replace("#", "")
         
-        val sentences = cleanText.split(Regex("(?<=[.!?,;:\n])\\s+"))
+        // 5. Split by sentence-ending punctuation (followed by whitespace) or newlines
+        val sentences = cleanText.split(Regex("(?<=[.!?])\\s+|\\n+"))
             .map { it.trim() }
             .filter { it.isNotEmpty() }
             

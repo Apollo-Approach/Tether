@@ -10,13 +10,35 @@ import uuid
 import ast
 import urllib.parse
 import websockets
+from typing import Any, Callable, Coroutine, Dict, List, Set, Optional, TYPE_CHECKING
+import config
+
+if TYPE_CHECKING:
+    from receiver import AppState
+    from project_manager import ProjectManager
+    from cdp_client import RoverCDPClient
+
 
 class WebSocketServer:
     """
     Encapsulates the WebSocket server logic, handling clients, broadcasting,
     and tailing the transcript.
     """
-    def __init__(self, state, project_manager, cdp_client, brain_dir: str):
+    state: AppState
+    project_manager: ProjectManager
+    cdp_client: RoverCDPClient
+    brain_dir: str
+    tailer_task: asyncio.Task[None] | None
+    _tailer_cancel: asyncio.Event | None
+    queue_monitor_task: asyncio.Task[None] | None
+
+    def __init__(
+        self,
+        state: AppState,
+        project_manager: ProjectManager,
+        cdp_client: RoverCDPClient,
+        brain_dir: str
+    ) -> None:
         self.state = state
         self.project_manager = project_manager
         self.cdp_client = cdp_client
@@ -26,7 +48,7 @@ class WebSocketServer:
         self._tailer_cancel = None
         self.queue_monitor_task = None
 
-    async def broadcast(self, msg_dict):
+    async def broadcast(self, msg_dict: dict[str, Any]) -> None:
         """Send a message to all connected WebSocket clients."""
         print(f"[DEBUG] broadcast called! connected_clients count: {len(self.state.connected_clients)}, type: {msg_dict.get('type')}", flush=True)
         if not self.state.connected_clients:
@@ -34,84 +56,92 @@ class WebSocketServer:
             return
         payload = json.dumps(msg_dict)
         print(f"[DEBUG] Sending payload to {len(self.state.connected_clients)} clients. Payload starts with: {payload[:50]}", flush=True)
-        tasks = [asyncio.create_task(client.send(payload)) for client in self.state.connected_clients]
-        try:
-            results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5.0)
-            print(f"[DEBUG] Broadcast results: {results}", flush=True)
-        except asyncio.TimeoutError:
-            print("[DEBUG] Broadcast timed out", flush=True)
+        
+        async def send_with_timeout(client: Any) -> None:
+            try:
+                await asyncio.wait_for(client.send(payload), timeout=config.BROADCAST_TIMEOUT_SEC)
+            except Exception as e:
+                print(f"[DEBUG] Broadcast to a client failed or timed out: {e}", flush=True)
+                
+        tasks = [asyncio.create_task(send_with_timeout(client)) for client in self.state.connected_clients]
+        await asyncio.gather(*tasks)
 
-    async def process_transcript_entry(self, data):
+    async def process_transcript_entry(self, data: dict[str, Any]) -> None:
         """Process a single transcript entry and broadcast relevant events."""
         step_type = data.get("type")
 
         if step_type == "USER_INPUT":
-            content = data.get("content", "")
+            content = str(data.get("content", ""))
             match = re.search(r'<USER_REQUEST>(.*?)</USER_REQUEST>', content, re.DOTALL)
             if match:
                 content = match.group(1).strip()
             await self.broadcast({"type": "chat", "role": "user", "message": content})
 
         elif step_type == "PLANNER_RESPONSE":
-            thinking = data.get("thinking", "")
+            thinking = str(data.get("thinking", ""))
             if thinking:
                 await self.broadcast({"type": "thought", "text": thinking})
 
-            content = data.get("content", "")
+            content = str(data.get("content", ""))
             if content:
                 await self.broadcast({"type": "chat", "role": "assistant", "message": content})
 
-            for call in data.get("tool_calls", []):
-                call_name = call.get("name")
-                args = call.get("args", {})
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except Exception:
+            tool_calls = data.get("tool_calls", [])
+            if isinstance(tool_calls, list):
+                for call in tool_calls:
+                    if not isinstance(call, dict):
+                        continue
+                    call_name = call.get("name")
+                    args = call.get("args", {})
+                    if isinstance(args, str):
                         try:
-                            args = ast.literal_eval(args)
+                            args = json.loads(args)
                         except Exception:
-                            pass
+                            try:
+                                args = ast.literal_eval(args)
+                            except Exception:
+                                pass
 
-                if call_name == "write_to_file":
-                    if isinstance(args, dict):
-                        filename = args.get("TargetFile", "")
-                        if filename.endswith(".md"):
-                            meta = args.get("ArtifactMetadata", {})
-                            title = meta.get("Summary", filename)
-                            code_content = args.get("CodeContent", "")
-                            await self.broadcast({
-                                "type": "artifact",
-                                "title": title,
-                                "content": code_content
-                            })
+                    if call_name == "write_to_file":
+                        if isinstance(args, dict):
+                            filename = str(args.get("TargetFile", ""))
+                            if filename.endswith(".md"):
+                                meta = args.get("ArtifactMetadata", {})
+                                title = meta.get("Summary", filename) if isinstance(meta, dict) else filename
+                                code_content = str(args.get("CodeContent", ""))
+                                await self.broadcast({
+                                    "type": "artifact",
+                                    "title": title,
+                                    "content": code_content
+                                })
 
-                elif call_name == "ask_permission":
-                    if isinstance(args, dict):
-                        action = args.get("Action", "Unknown Action")
-                        target = args.get("Target", "Unknown Target")
-                        title = f"Permission Request: {action} on {target}"
-                        options = ["Approve", "Approve Once", "Approve (Project)", "Deny"]
-                        await self.broadcast({
-                            "type": "approval_request",
-                            "title": title,
-                            "options": options
-                        })
-
-                elif call_name == "ask_question":
-                    if isinstance(args, dict):
-                        questions = args.get("questions", [])
-                        if questions and isinstance(questions, list) and len(questions) > 0:
-                            q = questions[0]
-                            title = q.get("question", "Question")
-                            options = q.get("options", ["Yes", "No"])
+                    elif call_name == "ask_permission":
+                        if isinstance(args, dict):
+                            action = args.get("Action", "Unknown Action")
+                            target = args.get("Target", "Unknown Target")
+                            title = f"Permission Request: {action} on {target}"
+                            options = ["Approve", "Approve Once", "Approve (Project)", "Deny"]
                             await self.broadcast({
                                 "type": "approval_request",
                                 "title": title,
                                 "options": options
                             })
 
-    async def transcript_tailer(self, cancel_event):
+                    elif call_name == "ask_question":
+                        if isinstance(args, dict):
+                            questions = args.get("questions", [])
+                            if questions and isinstance(questions, list) and len(questions) > 0:
+                                q = questions[0]
+                                if isinstance(q, dict):
+                                    title = q.get("question", "Question")
+                                    options = q.get("options", ["Yes", "No"])
+                                    await self.broadcast({
+                                        "type": "approval_request",
+                                        "title": title,
+                                        "options": options
+                                    })
+
+    async def transcript_tailer(self, cancel_event: asyncio.Event) -> None:
         """Tails the active conversation's transcript. Stops when cancel_event is set."""
         while not cancel_event.is_set():
             if not self.state.active_conversation_id:
@@ -165,7 +195,7 @@ class WebSocketServer:
                 if not cancel_event.is_set():
                     await asyncio.sleep(2)
 
-    async def restart_tailer(self):
+    async def restart_tailer(self) -> None:
         """Stop existing tailer and start a new one for the active conversation."""
         print(f"[DEBUG] restart_tailer called! active_conversation_id: {self.state.active_conversation_id}", flush=True)
 
@@ -195,7 +225,7 @@ class WebSocketServer:
             except asyncio.CancelledError:
                 pass
         
-        async def on_state_change(state_data):
+        async def on_state_change(state_data: dict[str, Any]) -> None:
             await self.broadcast({"type": "queue_update", "messages": state_data.get("messages", [])})
             await self.broadcast({"type": "tasks_update", "tasks": state_data.get("tasks", [])})
 
@@ -209,7 +239,7 @@ class WebSocketServer:
         else:
             print("[TAILER] No conversation selected", flush=True)
 
-    def save_image_to_conversation(self, base64_data, conversation_id):
+    def save_image_to_conversation(self, base64_data: str, conversation_id: str) -> str | None:
         """Save a base64-encoded image to the conversation directory.
         Returns the file path on success, None on failure."""
         try:
@@ -228,7 +258,7 @@ class WebSocketServer:
             print(f"Error saving image: {e}", file=sys.stderr)
             return None
 
-    async def handle_client(self, websocket, *args, mock=False, **kwargs):
+    async def handle_client(self, websocket: Any, *args: Any, mock: bool = False, **kwargs: Any) -> None:
         """Handles incoming WebSocket connections and processes JSON control messages."""
 
         # Auto-approve connection since Tailscale provides transport security
@@ -245,18 +275,23 @@ class WebSocketServer:
             # Send handshake with project details
             projects = self.project_manager.get_projects_with_details()
             handshake_data = {
-                "projects": [p["name"] for p in projects],
+                "projects": [p["name"] for p in projects if "name" in p],
                 "projectDetails": projects,
                 "activeConversation": self.state.active_conversation_id or "",
                 "activeProject": self.state.active_project_name or "",
-                "current_project": projects[0]["name"] if projects else ""
+                "current_project": projects[0]["name"] if projects and "name" in projects[0] else ""
             }
             await websocket.send(json.dumps({"type": "handshake", "data": handshake_data}))
         except Exception as e:
             print(f"Error sending handshake: {e}", file=sys.stderr)
 
         try:
+            audio_buffer = bytearray()
             async for message in websocket:
+                if isinstance(message, bytes):
+                    audio_buffer.extend(message)
+                    continue
+
                 try:
                     try:
                         data = json.loads(message)
@@ -268,9 +303,48 @@ class WebSocketServer:
                         print("Error: Invalid payload format, expected JSON object", file=sys.stderr)
                         continue
 
-                    event = data.get("event")
+                    event = data.get("event") or data.get("type")
                     if not event:
                         print("Error: Missing event type in payload", file=sys.stderr)
+                        continue
+                        
+                    if event == "voice_stream_end":
+                        if audio_buffer:
+                            print(f"[VOICE] Transcribing {len(audio_buffer)} bytes of audio...", flush=True)
+                            
+                            def transcribe_audio(audio_data: bytes) -> str:
+                                import numpy as np
+                                from faster_whisper import WhisperModel
+                                
+                                audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+                                
+                                if not hasattr(self, "_whisper_model"):
+                                    print("[VOICE] Loading Whisper model...", flush=True)
+                                    self._whisper_model = WhisperModel("base.en", device="cpu", compute_type="int8")
+                                
+                                segments, _ = self._whisper_model.transcribe(audio_np, beam_size=5)
+                                text = " ".join([segment.text for segment in segments]).strip()
+                                return text
+
+                            try:
+                                text = await asyncio.to_thread(transcribe_audio, bytes(audio_buffer))
+                                audio_buffer.clear()
+                                
+                                if text:
+                                    print(f"[VOICE] Transcribed: {text}", flush=True)
+                                    if not mock and self.state.active_conversation_id:
+                                        success = await self.cdp_client.inject_chat(text, self.state.active_conversation_id)
+                                        if success:
+                                            print(f"[VOICE] Injected via CDP to {self.state.active_conversation_id[:12]}...", flush=True)
+                                        else:
+                                            print(f"[VOICE] CDP injection failed", file=sys.stderr, flush=True)
+                                    else:
+                                        print("Error: No conversation selected for voice", file=sys.stderr)
+                                else:
+                                    print("[VOICE] Transcribed text was empty", flush=True)
+                            except Exception as e:
+                                print(f"Error transcribing audio: {e}", file=sys.stderr)
+                                audio_buffer.clear()
                         continue
 
                     # ─── Project Selection ───
@@ -283,7 +357,7 @@ class WebSocketServer:
 
                         # Find the project's folder name
                         projects = self.project_manager.get_projects_with_details()
-                        project = next((p for p in projects if p["name"] == project_name), None)
+                        project = next((p for p in projects if p.get("name") == project_name), None)
                         if not project:
                             print(f"Error: Project '{project_name}' not found", file=sys.stderr)
                             continue
@@ -332,7 +406,7 @@ class WebSocketServer:
 
                     # ─── Create Project ───
                     elif event == "create_project":
-                        project_name = data.get("name", "").strip()
+                        project_name = str(data.get("name", "")).strip()
                         if not project_name:
                             print("Error: Missing project name in create_project", file=sys.stderr)
                             continue
@@ -344,8 +418,6 @@ class WebSocketServer:
                             continue
                         
                         # 1. Create the directory on disk
-                        import os
-                        import config
                         dev_dir = config.get_dev_directory()
                         project_path = os.path.join(dev_dir, project_name)
                         await asyncio.to_thread(os.makedirs, project_path, exist_ok=True)
@@ -353,19 +425,19 @@ class WebSocketServer:
                         
                         # 2. Use CDP to create the project in Antigravity's UI
                         try:
-                            success = await self.cdp_client.inject_create_project(
+                            created_id = await self.cdp_client.inject_create_project(
                                 project_name,
                                 self.state.active_conversation_id
                             )
-                            if success:
-                                print(f"[CREATE_PROJECT] Project created in Antigravity (section: {success})", flush=True)
+                            if created_id:
+                                print(f"[CREATE_PROJECT] Project created in Antigravity (section: {created_id})", flush=True)
                                 
                                 # Use the section ID from the URL as the active conversation
                                 # This prevents inject_chat from navigating back to the old conversation
                                 self.state.active_project_name = project_name
-                                if success != "created":
-                                    self.state.active_conversation_id = success
-                                    print(f"[CREATE_PROJECT] Set active conversation to {success[:12]}...", flush=True)
+                                if created_id != "created":
+                                    self.state.active_conversation_id = created_id
+                                    print(f"[CREATE_PROJECT] Set active conversation to {created_id[:12]}...", flush=True)
                                 else:
                                     # Fallback: clear the conversation ID so inject_chat
                                     # uses whatever page is currently open
@@ -407,11 +479,11 @@ class WebSocketServer:
                         await self.broadcast({
                             "type": "handshake",
                             "data": {
-                                "projects": [p["name"] for p in new_projects],
+                                "projects": [p["name"] for p in new_projects if "name" in p],
                                 "projectDetails": new_projects,
                                 "activeConversation": self.state.active_conversation_id or "",
                                 "activeProject": self.state.active_project_name or "",
-                                "current_project": new_projects[0]["name"] if new_projects else ""
+                                "current_project": new_projects[0]["name"] if new_projects and "name" in new_projects[0] else ""
                             }
                         })
 
@@ -426,15 +498,15 @@ class WebSocketServer:
                             first_msg = ""
                             if self.state.active_project_name:
                                 projects = self.project_manager.get_projects_with_details()
-                                project = next((p for p in projects if p["name"] == self.state.active_project_name), None)
+                                project = next((p for p in projects if p.get("name") == self.state.active_project_name), None)
                                 if project:
                                     convos = self.project_manager.find_conversations_for_project(
                                         project.get("folderName", ""), 
                                         project.get("id", "")
                                     )
-                                    selected = next((c for c in convos if c["id"] == conv_id), None)
-                                    if selected:
-                                        first_msg = selected.get("firstMessage", "")
+                                    selected_conv = next((c for c in convos if c["id"] == conv_id), None)
+                                    if selected_conv:
+                                        first_msg = selected_conv.get("firstMessage", "")
                                         
                             await self.broadcast({
                                 "type": "project_selected",
@@ -473,24 +545,24 @@ class WebSocketServer:
                             
                         # Get project details
                         projects = self.project_manager.get_projects_with_details()
-                        project = next((p for p in projects if p["name"] == project_name), None)
+                        project = next((p for p in projects if p.get("name") == project_name), None)
                         if not project:
                             print(f"Error: Project '{project_name}' not found", file=sys.stderr)
                             continue
                             
-                        project_id = project.get("id")
+                        target_project_id = project.get("id")
                         folder_uri = project.get("folderUri", "")
                         
-                        if not project_id:
+                        if not target_project_id:
                             print(f"Error: Project '{project_name}' has no ID", file=sys.stderr)
                             continue
                             
                         try:
-                            success = self.project_manager.update_project_settings(
-                                project_id=project_id,
-                                is_turbo=turbo
+                            update_success = self.project_manager.update_project_settings(
+                                project_id=target_project_id,
+                                is_turbo=bool(turbo)
                             )
-                            if success:
+                            if update_success:
                                 print(f"[UPDATE_SETTINGS] Settings updated successfully via file watcher", flush=True)
                             else:
                                 print(f"[UPDATE_SETTINGS] Failed to update settings via file watcher", file=sys.stderr)
@@ -512,7 +584,7 @@ class WebSocketServer:
                                     })
                                     continue
                                 try:
-                                    success = await self.cdp_client.inject_chat(message_text, self.state.active_conversation_id)
+                                    success = await self.cdp_client.inject_chat(str(message_text), self.state.active_conversation_id)
                                     if success:
                                         print(f"[CHAT] Injected via CDP to {self.state.active_conversation_id[:12]}...", flush=True)
                                     else:
@@ -531,7 +603,7 @@ class WebSocketServer:
                         if base64_data:
                             print("[IMAGE] Received image payload", flush=True)
                             if not mock and self.state.active_conversation_id:
-                                filepath = await asyncio.to_thread(self.save_image_to_conversation, base64_data, self.state.active_conversation_id)
+                                filepath = await asyncio.to_thread(self.save_image_to_conversation, str(base64_data), self.state.active_conversation_id)
                                 if filepath:
                                     # Inject a chat message referencing the saved image via CDP
                                     content = f"[Image attached: {filepath}]"
@@ -575,7 +647,7 @@ class WebSocketServer:
                         option_text = data.get("option_text", "")
                         # Antigravity's ask_permission reads 1-indexed numeric responses from chat
                         # Option 0 (Approve) = "1", Option 1 (Approve Once) = "2", etc.
-                        numeric_response = str(option_index + 1)
+                        numeric_response = str(int(option_index) + 1) if isinstance(option_index, (int, float, str)) and str(option_index).isdigit() else "1"
                         print(f"[APPROVE] Received: option={option_index} ('{option_text}') -> injecting '{numeric_response}'", flush=True)
                         if not mock:
                             try:
@@ -617,7 +689,7 @@ class WebSocketServer:
                             if not mock and self.state.active_conversation_id:
                                 try:
                                     success = await self.cdp_client.manage_queued_message(
-                                        index, action, self.state.active_conversation_id
+                                        int(index), str(action), self.state.active_conversation_id
                                     )
                                     if success:
                                         print(f"[MANAGE_QUEUE] CDP action successful", flush=True)
@@ -633,7 +705,7 @@ class WebSocketServer:
                             print(f"[STOP_TASK] Action for task: {task_id}", flush=True)
                             if not mock and self.state.active_conversation_id:
                                 try:
-                                    await self.cdp_client.stop_task(task_id, self.state.active_conversation_id)
+                                    await self.cdp_client.stop_task(str(task_id), self.state.active_conversation_id)
                                     print(f"[STOP_TASK] CDP action sent", flush=True)
                                 except Exception as e:
                                     print(f"Error stopping task: {e}", file=sys.stderr)
@@ -653,3 +725,4 @@ class WebSocketServer:
             pass
         finally:
             self.state.connected_clients.discard(websocket)
+

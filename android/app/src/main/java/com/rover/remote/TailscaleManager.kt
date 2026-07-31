@@ -24,9 +24,12 @@ object TailscaleManager {
     private val scope = CoroutineScope(Dispatchers.IO)
     
     private var isStarted = false
+    private var pollingJob: kotlinx.coroutines.Job? = null
+    private var isPolling = false
 
     fun start(context: Context) {
         if (isStarted) return
+        isStarted = true // Set immediately to prevent race conditions
         
         _status.value = "Starting..."
         val stateDir = context.getDir("tailscale", Context.MODE_PRIVATE).absolutePath
@@ -34,7 +37,7 @@ object TailscaleManager {
         Thread {
             try {
                 // Initialize the Go tsnet wrapper
-                Tsnet_wrapper.startTailscale("rover-android", stateDir, object : AuthCallback {
+                Tsnet_wrapper.startTailscale(Config.TAILSCALE_HOSTNAME, stateDir, object : AuthCallback {
                     override fun onAuthURL(url: String) {
                         _status.value = "Needs Login"
                         // Automatically open the browser for Google login
@@ -50,40 +53,60 @@ object TailscaleManager {
                 })
                 
                 // Once startTailscale returns, it means the node is up and authenticated,
-                // and the local proxy is running on 127.0.0.1:1080
+                // and the local proxy is running on 127.0.0.1 (Config.SOCKS_PROXY_PORT)
                 _status.value = "Connected"
-                isStarted = true
-                
-                // Start polling for peers
-                scope.launch {
-                    while (true) {
-                        try {
-                            val jsonString = Tsnet_wrapper.getPeers()
-                            val jsonArray = JSONArray(jsonString)
-                            val newPeers = mutableListOf<TailscalePeer>()
-                            for (i in 0 until jsonArray.length()) {
-                                val obj = jsonArray.getJSONObject(i)
-                                newPeers.add(TailscalePeer(
-                                    hostname = obj.getString("hostname"),
-                                    online = obj.getBoolean("online"),
-                                    ip = obj.optString("ip", "")
-                                ))
-                            }
-                            _peers.value = newPeers
-                        } catch (e: Exception) {
-                            e.printStackTrace()
-                        }
-                        delay(2000) // Poll every 2 seconds
-                    }
-                }
             } catch (e: Exception) {
                 e.printStackTrace()
                 _status.value = "Error: ${e.message}"
+                isStarted = false
             }
         }.start()
     }
     
+    fun startPolling() {
+        if (!isStarted || isPolling) return
+        isPolling = true
+        pollingJob = scope.launch {
+            while (isPolling) {
+                try {
+                    val jsonString = Tsnet_wrapper.getPeers()
+                    val jsonArray = JSONArray(jsonString)
+                    val newPeers = mutableListOf<TailscalePeer>()
+                    for (i in 0 until jsonArray.length()) {
+                        val obj = jsonArray.getJSONObject(i)
+                        newPeers.add(TailscalePeer(
+                            hostname = obj.getString("hostname"),
+                            online = obj.getBoolean("online"),
+                            ip = obj.optString("ip", "")
+                        ))
+                    }
+                    _peers.value = newPeers
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+                delay(Config.TAILSCALE_PEER_POLL_INTERVAL_MS)
+            }
+        }
+    }
+    
+    fun stopPolling() {
+        isPolling = false
+        pollingJob?.cancel()
+        pollingJob = null
+    }
+    
+    fun stop() {
+        if (!isStarted) return
+        try {
+            Tsnet_wrapper.stopTailscale()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        isStarted = false
+        _status.value = "Disconnected"
+    }
+    
     fun getLocalProxyUrl(targetPort: Int): String {
-        return "ws://127.0.0.1:$targetPort"
+        return "${Config.WS_SCHEME}${Config.LOOPBACK_IP}:$targetPort"
     }
 }

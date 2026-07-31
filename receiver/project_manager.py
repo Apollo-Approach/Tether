@@ -11,19 +11,38 @@ import sqlite3
 import re
 import time
 import uuid
+from typing import TypedDict, Any
+
+
+class ProjectDetailDict(TypedDict, total=False):
+    id: str
+    name: str
+    folderUri: str
+    folderName: str
+    lastActive: str
+    is_recent: bool
+    _json_mtime: float
+
+
+class ConversationDetailDict(TypedDict):
+    id: str
+    parentId: str
+    lastActive: str
+    firstMessage: str
+
 
 class ProjectManager:
     """
     Encapsulates project management logic, separating it from the main receiver loop.
     """
 
-    def __init__(self, projects_dir: str, conversations_dir: str, brain_dir: str, transcript_scan_lines: int = 30):
+    def __init__(self, projects_dir: str, conversations_dir: str, brain_dir: str, transcript_scan_lines: int = 30) -> None:
         self.projects_dir = projects_dir
         self.conversations_dir = conversations_dir
         self.brain_dir = brain_dir
         self.transcript_scan_lines = transcript_scan_lines
 
-    def get_projects_with_details(self) -> list[dict]:
+    def get_projects_with_details(self) -> list[ProjectDetailDict]:
         """Returns list of {id, name, folderUri, folderName} dicts, sorted by last user chat.
         
         Uses the authoritative conversation DB metadata blobs to map conversations
@@ -34,12 +53,12 @@ class ProjectManager:
         project_files = glob.glob(os.path.join(self.projects_dir, "*.json"))
 
         # Step 1: Load all projects and build a path -> project_name lookup
-        projects = []
-        path_to_project = {}  # normalized_path -> project_name
-        id_to_project = {}    # project_id -> project_name
-        for f in project_files:
+        projects: list[ProjectDetailDict] = []
+        path_to_project: dict[str, str] = {}  # normalized_path -> project_name
+        id_to_project: dict[str, str] = {}    # project_id -> project_name
+        for proj_file in project_files:
             try:
-                with open(f, 'r', encoding='utf-8') as file:
+                with open(proj_file, 'r', encoding='utf-8') as file:
                     data = json.load(file)
                     name = data.get("name", "")
                     proj_id = data.get("id", "")
@@ -60,7 +79,7 @@ class ProjectManager:
                             "name": name,
                             "folderUri": folder_uri,
                             "folderName": folder_name,
-                            "_json_mtime": os.path.getmtime(f),
+                            "_json_mtime": os.path.getmtime(proj_file),
                         })
                         # Build lookup for DB matching
                         if proj_id:
@@ -79,7 +98,7 @@ class ProjectManager:
         # Step 2: Map conversations to projects using DB metadata blobs
         # Each conversation DB has a trajectory_metadata_blob table containing
         # the workspace file:// URI as a protobuf-encoded string.
-        conv_to_project = {}  # conv_id -> project_name
+        conv_to_project: dict[str, str] = {}  # conv_id -> project_name
         if os.path.isdir(self.conversations_dir):
             for db_file in os.listdir(self.conversations_dir):
                 if not db_file.endswith('.db'):
@@ -125,23 +144,23 @@ class ProjectManager:
 
         # Step 3: For each project, find the latest USER_INPUT timestamp
         # across all its conversations
-        project_last_user = {}  # project_name -> latest ISO timestamp
+        project_last_user: dict[str, str] = {}  # project_name -> latest ISO timestamp
         for conv_id, proj_name in conv_to_project.items():
             transcript = os.path.join(self.brain_dir, conv_id, '.system_generated', 'logs', 'transcript.jsonl')
             if not os.path.exists(transcript):
                 continue
             try:
-                with open(transcript, 'rb') as f:
-                    f.seek(0, 2)
-                    size = f.tell()
-                    f.seek(max(0, size - 200000))
-                    chunk = f.read().decode('utf-8', errors='replace')
+                with open(transcript, 'rb') as tr_file:
+                    tr_file.seek(0, 2)
+                    size = tr_file.tell()
+                    tr_file.seek(max(0, size - 200000))
+                    chunk = tr_file.read().decode('utf-8', errors='replace')
                     for line in reversed(chunk.splitlines()):
                         if not line.strip():
                             continue
                         try:
                             d = json.loads(line)
-                            ts = d.get('created_at', '')
+                            ts = str(d.get('created_at', ''))
                             if ts:
                                 if proj_name not in project_last_user or ts > project_last_user[proj_name]:
                                     project_last_user[proj_name] = ts
@@ -154,12 +173,12 @@ class ProjectManager:
         # Step 4: Apply timestamps and sort
         # Sort: Projects with conversations (most recent first) -> Projects without conversations (by file mtime)
         for p in projects:
-            p['lastActive'] = project_last_user.get(p['name'], "")
+            p['lastActive'] = project_last_user.get(p.get('name', ''), "")
             p['is_recent'] = bool(p['lastActive'])
 
         projects.sort(key=lambda x: (
-            1 if x["is_recent"] else 0,
-            x["lastActive"] if x["is_recent"] else x.get("_json_mtime", 0)
+            1 if x.get("is_recent") else 0,
+            x.get("lastActive") if x.get("is_recent") else x.get("_json_mtime", 0)
         ), reverse=True)
 
         # Clean up internal fields before returning
@@ -170,7 +189,7 @@ class ProjectManager:
 
         return projects
 
-    def find_conversations_for_project(self, folder_name: str, project_id: str = None) -> list[dict]:
+    def find_conversations_for_project(self, folder_name: str | None, project_id: str | None = None) -> list[ConversationDetailDict]:
         """Find conversations belonging to a project using authoritative DB metadata.
         Returns list of {id, lastActive, firstMessage} dicts, sorted by recency."""
         if (not folder_name and not project_id) or not os.path.isdir(self.brain_dir):
@@ -181,7 +200,7 @@ class ProjectManager:
         target_lower = folder_name.lower() if folder_name else None
 
         # Scan conversation DBs for matching workspace URIs
-        matching_convs = []  # (conv_id, transcript_path, mtime)
+        matching_convs: list[tuple[str, str, float]] = []  # (conv_id, transcript_path, mtime)
         if os.path.isdir(self.conversations_dir):
             for db_file in os.listdir(self.conversations_dir):
                 if not db_file.endswith('.db'):
@@ -229,7 +248,7 @@ class ProjectManager:
         matching_convs.sort(key=lambda x: x[2], reverse=True)
 
         # Build child_to_parent mapping by scanning transcripts for invoke_subagent responses
-        child_to_parent = {}
+        child_to_parent: dict[str, str] = {}
         for conv_id, transcript_path, _ in matching_convs:
             try:
                 with open(transcript_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -238,7 +257,7 @@ class ProjectManager:
                             try:
                                 d = json.loads(line)
                                 if d.get('type') == 'TOOL_RESPONSE' and 'invoke_subagent' in d.get('name', ''):
-                                    c = d.get('content', '')
+                                    c = str(d.get('content', ''))
                                     ids = re.findall(r'([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', c)
                                     for sub_id in ids:
                                         if sub_id != conv_id:
@@ -249,7 +268,7 @@ class ProjectManager:
                 pass
 
         # Extract first user message preview from each matching conversation
-        matches = []
+        matches: list[ConversationDetailDict] = []
         for conv_id, transcript_path, mtime in matching_convs:
             try:
                 first_user_msg = ""
@@ -261,14 +280,15 @@ class ProjectManager:
                         try:
                             d = json.loads(line)
                             if d.get('type') == 'USER_INPUT' and not first_user_msg:
+                                content_str = str(d.get('content', ''))
                                 match = re.search(
                                     r'<USER_REQUEST>(.*?)(?:</USER_REQUEST>|$)',
-                                    d.get('content', ''), re.DOTALL
+                                    content_str, re.DOTALL
                                 )
                                 if match:
                                     first_user_msg = match.group(1).strip()[:120]
                                 else:
-                                    first_user_msg = d.get('content', '').strip()[:120]
+                                    first_user_msg = content_str.strip()[:120]
                                 break
                         except (json.JSONDecodeError, Exception):
                             continue
@@ -334,7 +354,7 @@ class ProjectManager:
             json.dump(proj_json, f, indent=2)
         print(f"[CREATE_PROJECT] JSON written: {json_path} (exists={os.path.isfile(json_path)})", flush=True)
 
-    def update_project_settings(self, project_id: str, is_turbo: bool):
+    def update_project_settings(self, project_id: str, is_turbo: bool) -> bool:
         json_path = os.path.join(self.projects_dir, f"{project_id}.json")
         if not os.path.exists(json_path):
             return False
@@ -357,3 +377,4 @@ class ProjectManager:
         except Exception as e:
             print(f"Error updating project settings: {e}")
             return False
+

@@ -19,17 +19,31 @@ enum class InteractionMode(val label: String, val description: String) {
     SILENT("Silent", "Text only, no audio")
 }
 
-
 data class RunningTask(
     val id: String,
     val name: String
 )
 
-data class AppState(
+data class RoverHost(
+    val name: String,
+    val localIp: String? = null,
+    val localPort: Int? = null,
+    val tailscaleIp: String? = null,
+    val os: String = ""
+)
 
+data class TrustedNetwork(
+    val ssid: String,
+    val lat: Double,
+    val lng: Double
+)
+
+data class AppState(
     val connectionStatus: String = "Disconnected",
+    val connectedHostName: String? = null,
     val chatMessages: List<ChatMessage> = emptyList(),
     val currentArtifact: ArtifactMessage? = null,
+    val artifactHistory: Map<String, ArtifactMessage> = emptyMap(),
     val currentApprovalRequest: ApprovalRequest? = null,
     val allProjects: List<String> = emptyList(),
     val currentProject: String = "",
@@ -44,17 +58,100 @@ data class AppState(
     val interactionMode: InteractionMode = InteractionMode.SILENT,
     val isTurboMode: Boolean = false,
     val queuedMessages: List<String> = emptyList(),
-    val runningTasks: List<RunningTask> = emptyList()
+    val runningTasks: List<RunningTask> = emptyList(),
+    val isMicListening: Boolean = false,
+    val trustedNetworks: List<TrustedNetwork> = emptyList()
 )
 
 object ConnectionRepository {
     var webSocketManager: WebSocketManager? = null
     var ttsManager: TTSManager? = null
+    var networkManager: NetworkManager? = null
+    var appContext: android.content.Context? = null
+    
+    fun init(context: android.content.Context) {
+        appContext = context.applicationContext
+        if (networkManager == null) {
+            networkManager = NetworkManager(context)
+            
+            val prefs = context.getSharedPreferences("ConnectionPrefs", android.content.Context.MODE_PRIVATE)
+            lastHost = prefs.getString("lastConnectedHost", null)
+            
+            // Load trusted networks
+            val savedNetworks = prefs.getString("trustedNetworks", "[]")
+            try {
+                val jsonArray = org.json.JSONArray(savedNetworks)
+                val networks = mutableListOf<TrustedNetwork>()
+                for (i in 0 until jsonArray.length()) {
+                    val obj = jsonArray.getJSONObject(i)
+                    networks.add(TrustedNetwork(
+                        obj.getString("ssid"),
+                        obj.getDouble("lat"),
+                        obj.getDouble("lng")
+                    ))
+                }
+                _state.update { it.copy(trustedNetworks = networks) }
+            } catch (e: Exception) {}
+        }
+    }
+    
+    private fun saveTrustedNetworks(networks: List<TrustedNetwork>) {
+        appContext?.let { ctx ->
+            val prefs = ctx.getSharedPreferences("ConnectionPrefs", android.content.Context.MODE_PRIVATE)
+            val jsonArray = org.json.JSONArray()
+            networks.forEach { net ->
+                val obj = org.json.JSONObject()
+                obj.put("ssid", net.ssid)
+                obj.put("lat", net.lat)
+                obj.put("lng", net.lng)
+                jsonArray.put(obj)
+            }
+            prefs.edit().putString("trustedNetworks", jsonArray.toString()).apply()
+        }
+    }
+    
     private val _state = MutableStateFlow(AppState())
     val state: StateFlow<AppState> = _state.asStateFlow()
+    
+    private var lastHost: String? = null
 
     fun updateConnectionStatus(status: String) {
         _state.update { it.copy(connectionStatus = status) }
+    }
+
+    fun updateConnectedHostName(name: String?) {
+        _state.update { it.copy(connectedHostName = name) }
+        if (name != null) {
+            lastHost = name
+            appContext?.let { ctx ->
+                val prefs = ctx.getSharedPreferences("ConnectionPrefs", android.content.Context.MODE_PRIVATE)
+                prefs.edit().putString("lastConnectedHost", name).apply()
+            }
+        }
+    }
+
+    fun getLastConnectedHost(): String? {
+        return lastHost ?: _state.value.connectedHostName
+    }
+
+    fun setMicListening(isListening: Boolean) {
+        _state.update { it.copy(isMicListening = isListening) }
+    }
+
+    fun addTrustedNetwork(net: TrustedNetwork) {
+        _state.update { 
+            val newNetworks = it.trustedNetworks + net
+            saveTrustedNetworks(newNetworks)
+            it.copy(trustedNetworks = newNetworks) 
+        }
+    }
+
+    fun removeTrustedNetwork(ssid: String) {
+        _state.update { state -> 
+            val newNetworks = state.trustedNetworks.filter { it.ssid != ssid }
+            saveTrustedNetworks(newNetworks)
+            state.copy(trustedNetworks = newNetworks)
+        }
     }
 
     fun updateTurboMode(turbo: Boolean) {
@@ -71,6 +168,10 @@ object ConnectionRepository {
         _state.update { it.copy(discoveredHosts = hosts) }
     }
 
+    fun clearDiscoveredHosts() {
+        _state.update { it.copy(discoveredHosts = emptyList()) }
+    }
+
     fun addChatMessage(message: ChatMessage) {
         _state.update { state -> 
             state.copy(chatMessages = state.chatMessages + message)
@@ -78,7 +179,14 @@ object ConnectionRepository {
     }
 
     fun setArtifact(artifact: ArtifactMessage?) {
-        _state.update { it.copy(currentArtifact = artifact) }
+        _state.update { state -> 
+            val updatedHistory = if (artifact != null) {
+                state.artifactHistory + (artifact.title to artifact)
+            } else {
+                state.artifactHistory
+            }
+            state.copy(currentArtifact = artifact, artifactHistory = updatedHistory)
+        }
     }
 
     fun setApprovalRequest(request: ApprovalRequest?) {

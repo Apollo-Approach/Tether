@@ -24,9 +24,12 @@ import java.net.InetAddress
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetSocketAddress
+import android.net.wifi.WifiManager
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.MutableStateFlow
 class RoverService : Service() {
     companion object {
         const val ACTION_CONNECT = "com.rover.remote.CONNECT"
@@ -56,7 +59,7 @@ class RoverService : Service() {
                     val content = json.optString("content", "")
                     val artifactMsg = ArtifactMessage(title, content)
                     ConnectionRepository.setArtifact(artifactMsg)
-                    ConnectionRepository.addChatMessage(ChatMessage("assistant", "📝 **Artifact Updated:** $title\n\n$content"))
+                    ConnectionRepository.addChatMessage(ChatMessage("assistant", "📝 **Artifact Updated:** $title"))
                     showMessageNotification("Artifact Updated", title)
                 } else if (type == "handshake") {
                     val dataObj = json.optJSONObject("data")
@@ -163,34 +166,55 @@ class RoverService : Service() {
         }
     }
 
-    private val CHANNEL_ID = "RoverServiceChannel"
-    private val MESSAGE_CHANNEL_ID = "RoverMessageChannel"
+    private val CHANNEL_ID = Config.FOREGROUND_SERVICE_CHANNEL_ID
+    private val MESSAGE_CHANNEL_ID = Config.MESSAGE_NOTIFICATION_CHANNEL_ID
     private val scope = CoroutineScope(Dispatchers.IO)
     private lateinit var nsdManager: NsdManager
     private var discoveryListener: NsdManager.DiscoveryListener? = null
     private var udpDiscoveryJob: Job? = null
     private var udpSocket: DatagramSocket? = null
+    private var multicastLock: WifiManager.MulticastLock? = null
     private val webSocketManager = WebSocketManager()
     
     private var ttsManager: TTSManager? = null
     private var audioMediaManager: AudioFocusAndMediaManager? = null
-    private var voiceManager: VoiceRecognizerManager? = null
+    
+    private var btRoutingManager: BluetoothVoiceRoutingManager? = null
+    private var voiceRecognizerManager: VoiceRecognizerManager? = null
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannels()
         ConnectionRepository.webSocketManager = webSocketManager
         
+        btRoutingManager = BluetoothVoiceRoutingManager(this)
+        voiceRecognizerManager = VoiceRecognizerManager(
+            context = this,
+            btRoutingManager = btRoutingManager!!,
+            onResult = { text ->
+                if (text.isNotBlank() && ConnectionRepository.state.value.connectionStatus == "Connected") {
+                    val json = org.json.JSONObject().apply {
+                        put("event", "chat")
+                        put("message", text)
+                        put("project", ConnectionRepository.state.value.currentProject)
+                    }
+                    webSocketManager.send(json.toString())
+                    ConnectionRepository.setThinking(true)
+                }
+            },
+            onStateChange = { isListening ->
+                ConnectionRepository.setMicListening(isListening)
+            }
+        )
+        
+        
         ttsManager = TTSManager(this) {
             // TTS finished reading
             audioMediaManager?.dismissMediaNotification()
             
-            // Only auto-start listening in Hands-Free mode
+            // Interaction mode handling for hands-free
             if (ConnectionRepository.state.value.interactionMode == InteractionMode.HANDS_FREE) {
-                // Keep audio focus alive for the microphone via Bluetooth SCO
-                voiceManager?.startListening()
-            } else {
-                audioMediaManager?.abandonAudioFocus()
+                voiceRecognizerManager?.startListening()
             }
         }
         ConnectionRepository.ttsManager = ttsManager
@@ -202,22 +226,123 @@ class RoverService : Service() {
             },
             onStopAction = {
                 ttsManager?.stop()
-                voiceManager?.stopListening()
                 audioMediaManager?.abandonAudioFocus()
             }
         )
         
-        voiceManager = VoiceRecognizerManager(this, onResult = { text ->
-            val payload = JSONObject().apply {
-                put("event", "chat")
-                put("message", text)
+        val isTrustedNetworkFlow = MutableStateFlow(false)
+
+        var lastVerifiedSsid: String? = null
+        
+        scope.launch {
+            while (isActive) {
+                var isTrusted = false
+                val netState = ConnectionRepository.networkManager?.networkState?.value
+                if (netState != null) {
+                    val isWifi = netState.type == NetworkType.WIFI
+                    val ssid = netState.ssid
+                    if (isWifi && ssid != null && ssid != "<unknown ssid>") {
+                        val trusted = ConnectionRepository.state.value.trustedNetworks.find { it.ssid == ssid }
+                        if (trusted != null) {
+                            if (lastVerifiedSsid == ssid) {
+                                isTrusted = true
+                            } else {
+                                val loc = LocationVerifier.getCurrentLocation(this@RoverService)
+                                if (loc != null) {
+                                    val target = android.location.Location("").apply {
+                                        latitude = trusted.lat
+                                        longitude = trusted.lng
+                                    }
+                                    // Increased from 100m to 1000m to account for indoor cell-tower fallback drift,
+                                    // while still strictly preventing evil twin attacks from other locations.
+                                    if (loc.distanceTo(target) <= 1000f) {
+                                        isTrusted = true
+                                        lastVerifiedSsid = ssid
+                                    }
+                                }
+                            }
+                        } else {
+                            lastVerifiedSsid = null
+                        }
+                    } else {
+                        lastVerifiedSsid = null
+                    }
+                } else {
+                    lastVerifiedSsid = null
+                }
+
+                val wasTrusted = isTrustedNetworkFlow.value
+                isTrustedNetworkFlow.value = isTrusted
+                
+                // If we crossed a trust boundary, sever the current WebSocket connection 
+                // to force a reconnect on the correct network path.
+                // We leave Tailscale running in the background because tsnet hangs if restarted.
+                if (wasTrusted != isTrusted) {
+                    webSocketManager.disconnect()
+                }
+
+                if (isTrusted && ConnectionRepository.state.value.connectionStatus != "Connected") {
+                    if (udpDiscoveryJob == null) {
+                        startDiscovery()
+                    }
+                } else {
+                    stopDiscovery()
+                }
+                
+                delay(2000)
             }
-            webSocketManager.send(payload.toString())
-            audioMediaManager?.abandonAudioFocus()
-        }, onError = { error ->
-            android.util.Log.e("RoverService", "Voice error: $error")
-            audioMediaManager?.abandonAudioFocus()
-        })
+        }
+        
+        scope.launch {
+            var lastTailscaleConnectAttempt = 0L
+            while (isActive) {
+                val now = System.currentTimeMillis()
+                val status = ConnectionRepository.state.value.connectionStatus
+                val isTrusted = isTrustedNetworkFlow.value
+                
+                if (!isTrusted && (status == "Disconnected" || status.startsWith("Error")) && now - lastTailscaleConnectAttempt > Config.AUTO_CONNECT_COOLDOWN_MS) {
+                    val lastHost = ConnectionRepository.getLastConnectedHost()
+                    if (lastHost != null) {
+                        // Ensure Tailscale is running in the background for proxy routing
+                        TailscaleManager.start(this@RoverService)
+                        
+                        // Query the Go daemon directly instead of relying on the UI drawer's polling loop
+                        try {
+                            if (TailscaleManager.status.value == "Connected") {
+                                val jsonString = tsnet_wrapper.Tsnet_wrapper.getPeers()
+                                val jsonArray = org.json.JSONArray(jsonString)
+                                var targetIp = ""
+                                var isOnline = false
+                                
+                                for (i in 0 until jsonArray.length()) {
+                                    val obj = jsonArray.getJSONObject(i)
+                                    val peerHostname = obj.getString("hostname").lowercase().replace(Regex("[^a-z0-9]"), "")
+                                    val sanitizedLastHost = lastHost.lowercase().replace(Regex("[^a-z0-9]"), "")
+                                    
+                                    if (peerHostname == sanitizedLastHost || peerHostname.contains(sanitizedLastHost) || sanitizedLastHost.contains(peerHostname)) {
+                                        targetIp = obj.optString("ip", "")
+                                        isOnline = obj.getBoolean("online")
+                                        break
+                                    }
+                                }
+                                
+                                if (isOnline && targetIp.isNotEmpty()) {
+                                    lastTailscaleConnectAttempt = now
+                                    ConnectionRepository.updateConnectedHostName(lastHost)
+                                    ConnectionRepository.updateConnectionStatus("Connecting...")
+                                    val formattedHost = if (targetIp.contains(":") && !targetIp.startsWith("[")) "[$targetIp]" else targetIp
+                                    val url = "${Config.WS_SCHEME}$formattedHost:${Config.TSNET_PROXY_PORT}"
+                                    connectWebSocket(url)
+                                }
+                            }
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                        }
+                    }
+                }
+                delay(2000)
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -262,8 +387,15 @@ class RoverService : Service() {
             }
             return START_NOT_STICKY
         }
+        if (intent?.action == "com.rover.remote.TOGGLE_MIC") {
+            if (voiceRecognizerManager?.isListening == true) {
+                voiceRecognizerManager?.stopListening()
+            } else {
+                voiceRecognizerManager?.startListening()
+            }
+            return START_NOT_STICKY
+        }
         
-        startDiscovery()
         return START_NOT_STICKY
     }
 
@@ -307,7 +439,7 @@ class RoverService : Service() {
                     val host: InetAddress = serviceInfo.host
                     val port: Int = serviceInfo.port
                     val ip = host.hostAddress
-                    val url = "ws://$ip:$port"
+                    val url = "${Config.WS_SCHEME}$ip:$port"
                     
                     if (ip != null) {
                         var os = ""
@@ -318,7 +450,7 @@ class RoverService : Service() {
                             }
                         }
                         
-                        val hostObj = RoverHost(hostName, ip, port, os)
+                        val hostObj = RoverHost(name = hostName, localIp = ip, localPort = port, os = os)
                         val currentHosts = ConnectionRepository.state.value.discoveredHosts
                         if (currentHosts.none { it.name == hostObj.name }) {
                             ConnectionRepository.updateDiscoveredHosts(currentHosts + hostObj)
@@ -327,8 +459,12 @@ class RoverService : Service() {
 
                     val currentStatus = ConnectionRepository.state.value.connectionStatus
                     if (currentStatus != "Connected" && currentStatus != "Connecting...") {
-                        ConnectionRepository.updateConnectionStatus("Connecting...")
-                        connectWebSocket(url)
+                        val lastHost = ConnectionRepository.getLastConnectedHost()
+                        if (lastHost == hostName) {
+                            ConnectionRepository.updateConnectedHostName(hostName)
+                            ConnectionRepository.updateConnectionStatus("Connecting...")
+                            connectWebSocket(url)
+                        }
                     }
                     isResolving.set(false)
                     processResolveQueue()
@@ -342,12 +478,22 @@ class RoverService : Service() {
 
     private fun startDiscovery() {
         stopDiscovery()
+        
+        val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+        if (wifiManager != null) {
+            try {
+                multicastLock = wifiManager.createMulticastLock("RoverMulticastLock")
+                multicastLock?.setReferenceCounted(true)
+                multicastLock?.acquire()
+            } catch (e: Exception) {}
+        }
+        
         // 1. Start standard NsdManager discovery (fallback/legacy)
         nsdManager = getSystemService(Context.NSD_SERVICE) as NsdManager
         discoveryListener = object : NsdManager.DiscoveryListener {
             override fun onDiscoveryStarted(regType: String) {}
             override fun onServiceFound(service: android.net.nsd.NsdServiceInfo) {
-                if (service.serviceType == "_rover._tcp." || service.serviceType == "_rover._tcp.local.") {
+                if (service.serviceType == Config.MDNS_SERVICE_TYPE || service.serviceType == Config.MDNS_SERVICE_TYPE_LOCAL) {
                     resolveQueue.add(service)
                     processResolveQueue()
                 }
@@ -366,7 +512,7 @@ class RoverService : Service() {
         }
         
         try {
-            nsdManager.discoverServices("_rover._tcp.", NsdManager.PROTOCOL_DNS_SD, discoveryListener)
+            nsdManager.discoverServices(Config.MDNS_SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, discoveryListener)
         } catch (e: Exception) {
             e.printStackTrace()
         }
@@ -377,23 +523,30 @@ class RoverService : Service() {
                 udpSocket = DatagramSocket(null).apply {
                     reuseAddress = true
                     broadcast = true
-                    bind(InetSocketAddress(42839))
+                    bind(InetSocketAddress(Config.DISCOVERY_UDP_PORT))
                 }
                 
                 // Broadcaster: Ask "is anyone there?" every 3 seconds while disconnected
                 launch {
-                    val broadcastAddr = InetAddress.getByName("255.255.255.255")
-                    val message = "ROVER_DISCOVER".toByteArray()
-                    val packet = DatagramPacket(message, message.size, broadcastAddr, 42839)
+                    val message = Config.UDP_DISCOVERY_PAYLOAD.toByteArray()
+                    
                     while (isActive) {
-                        if (ConnectionRepository.state.value.connectionStatus != "Connected") {
+                        val status = ConnectionRepository.state.value.connectionStatus
+                        if (status != "Connected" && status != "Connecting...") {
                             try {
-                                udpSocket?.send(packet)
+                                val targetIps = getSubnetIps(this@RoverService)
+                                for (addr in targetIps) {
+                                    if (!isActive) break
+                                    try {
+                                        val packet = DatagramPacket(message, message.size, addr, Config.DISCOVERY_UDP_PORT)
+                                        udpSocket?.send(packet)
+                                    } catch (e: Exception) {}
+                                }
                             } catch (e: Exception) {
                                 // Ignore send errors
                             }
                         }
-                        delay(3000)
+                        delay(Config.UDP_BROADCAST_INTERVAL_MS)
                     }
                 }
 
@@ -406,18 +559,18 @@ class RoverService : Service() {
                     val data = String(packet.data, 0, packet.length)
                     try {
                         val json = JSONObject(data)
-                        if (json.optString("app") == "rover") {
+                        if (json.optString("app") == Config.APP_ID) {
                             val ip = packet.address.hostAddress
                             val port = json.getInt("port")
                             val hostname = json.optString("hostname", "RoverHost")
                             
                             // Emulate NsdManager successful resolution behavior
                             val currentHosts = ConnectionRepository.state.value.discoveredHosts
-                            if (currentHosts.none { it.ip == ip && it.port == port }) {
+                            if (currentHosts.none { it.localIp == ip && it.localPort == port }) {
                                 val newHost = RoverHost(
                                     name = hostname,
-                                    ip = ip!!,
-                                    port = port,
+                                    localIp = ip!!,
+                                    localPort = port,
                                     os = "Unknown"
                                 )
                                 ConnectionRepository.updateDiscoveredHosts(currentHosts + newHost)
@@ -425,10 +578,15 @@ class RoverService : Service() {
                             
                             // Auto-connect if disconnected
                             val now = System.currentTimeMillis()
-                            if (ConnectionRepository.state.value.connectionStatus == "Disconnected" && now - lastConnectAttempt > 3000) {
-                                lastConnectAttempt = now
-                                ConnectionRepository.updateConnectionStatus("Connecting...")
-                                connectWebSocket("ws://$ip:$port")
+                            val lastHost = ConnectionRepository.getLastConnectedHost()
+                            val status = ConnectionRepository.state.value.connectionStatus
+                            if ((status == "Disconnected" || status.startsWith("Error")) && now - lastConnectAttempt > Config.AUTO_CONNECT_COOLDOWN_MS) {
+                                if (lastHost == hostname) {
+                                    lastConnectAttempt = now
+                                    ConnectionRepository.updateConnectedHostName(hostname)
+                                    ConnectionRepository.updateConnectionStatus("Connecting...")
+                                    connectWebSocket("${Config.WS_SCHEME}$ip:$port")
+                                }
                             }
                         }
                     } catch (e: Exception) {
@@ -452,6 +610,15 @@ class RoverService : Service() {
         }
         discoveryListener = null
 
+        try {
+            multicastLock?.let {
+                if (it.isHeld) {
+                    it.release()
+                }
+            }
+            multicastLock = null
+        } catch (e: Exception) {}
+
         // Stop UDP Discovery
         udpDiscoveryJob?.cancel()
         udpDiscoveryJob = null
@@ -459,6 +626,8 @@ class RoverService : Service() {
             udpSocket?.close()
         } catch (e: Exception) {}
         udpSocket = null
+        
+        ConnectionRepository.clearDiscoveredHosts()
     }
 
     private fun connectWebSocket(url: String) {
@@ -527,7 +696,12 @@ class RoverService : Service() {
                 }
             }
         }
-        webSocketManager.connect(url, listener)
+        try {
+            webSocketManager.connect(url, listener)
+        } catch (t: Throwable) {
+            ConnectionRepository.updateConnectionStatus("Disconnected")
+            updateForegroundNotification("Connection Error")
+        }
     }
 
     private fun updateForegroundNotification(text: String) {
@@ -568,12 +742,44 @@ class RoverService : Service() {
         discoveryListener?.let {
             try { nsdManager.stopServiceDiscovery(it) } catch (e: Exception) {}
         }
+        try {
+            multicastLock?.let { if (it.isHeld) it.release() }
+        } catch (e: Exception) {}
         webSocketManager.disconnect()
         ttsManager?.release()
         audioMediaManager?.destroy()
-        voiceManager?.destroy()
+        voiceRecognizerManager?.destroy()
         scope.cancel()
         super.onDestroy()
+    }
+
+    private fun getSubnetIps(context: Context): List<InetAddress> {
+        val ips = mutableListOf<InetAddress>()
+        try {
+            // Always include standard global broadcast just in case it works
+            try { ips.add(InetAddress.getByName("255.255.255.255")) } catch (e: Exception) {}
+
+            val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            val dhcp = wifiManager?.dhcpInfo ?: return ips
+            
+            if (dhcp.ipAddress == 0 || dhcp.netmask == 0) return ips
+
+            val ipBE = Integer.reverseBytes(dhcp.ipAddress)
+            val maskBE = Integer.reverseBytes(dhcp.netmask)
+            
+            val networkBE = ipBE and maskBE
+            val broadcastBE = networkBE or maskBE.inv()
+            
+            // Add specific broadcast address
+            try {
+                val bcastBytes = ByteArray(4) { i -> ((broadcastBE shr (24 - i * 8)) and 0xFF).toByte() }
+                ips.add(InetAddress.getByAddress(bcastBytes))
+            } catch (e: Exception) {}
+
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        return ips
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

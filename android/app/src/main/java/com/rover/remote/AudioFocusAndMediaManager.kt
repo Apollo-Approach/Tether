@@ -244,13 +244,6 @@ class AudioFocusAndMediaManager(
                 audioManager.setCommunicationDevice(btDevice)
             }
         }
-        
-        try {
-            audioManager.startBluetoothSco()
-            audioManager.isBluetoothScoOn = true
-        } catch (e: Exception) {
-            Log.e("AudioMediaManager", "Error starting Bluetooth SCO", e)
-        }
 
         val result = audioManager.requestAudioFocus(focusRequest!!)
         

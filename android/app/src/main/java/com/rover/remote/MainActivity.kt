@@ -13,6 +13,13 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.ClipboardManager
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.clickable
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import android.graphics.Bitmap
@@ -54,14 +61,19 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.foundation.Canvas
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.foundation.Image
+import androidx.compose.ui.layout.ContentScale
 import com.rover.remote.ui.theme.*
 import com.rover.remote.ui.components.MarkdownText
 import kotlinx.coroutines.delay
@@ -79,13 +91,14 @@ import org.json.JSONObject
 
 data class ChatMessage(val role: String, val message: String)
 data class ArtifactMessage(val title: String, val content: String)
-data class RoverHost(val name: String, val ip: String, val port: Int, val os: String = "")
 data class ApprovalRequest(val title: String, val options: List<String>)
 
 
 class MainActivity : androidx.fragment.app.FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        ConnectionRepository.init(applicationContext)
+        TailscaleManager.start(this)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         SecurityManager.init(this)
 
@@ -104,8 +117,18 @@ class MainActivity : androidx.fragment.app.FragmentActivity() {
             startRoverService()
         }
 
-        // Auto-start Tailscale if it was already authenticated previously
-        // TailscaleManager.start(this)
+        val btRoutingManager = BluetoothVoiceRoutingManager(this)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // If the user returns to the app and the WebSocket is silently dead due to Doze,
+        // force a disconnect. The background service will instantly attempt a fresh reconnect.
+        // We MUST NOT call TailscaleManager.stop() because tsnet on Android hangs if restarted 
+        // in the same process. We rely on Tailscale's magicsock to recover the tunnel.
+        if (ConnectionRepository.state.value.connectionStatus != "Connected") {
+            ConnectionRepository.webSocketManager?.disconnect()
+        }
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
@@ -194,6 +217,7 @@ fun RemoteControlScreen() {
     val allProjects = state.allProjects
     val currentProject = state.currentProject
     val isThinking = state.isThinking
+    val isMicListening = state.isMicListening
     
     BackHandler(enabled = currentArtifact != null) {
         ConnectionRepository.setArtifact(null)
@@ -202,7 +226,7 @@ fun RemoteControlScreen() {
     val scope = rememberCoroutineScope()
     val webSocketManager = ConnectionRepository.webSocketManager
     
-    var urlInput by remember { mutableStateOf("ws://10.10.10.10:8080") }
+
     var showMoreProjects by remember { mutableStateOf(false) }
     var showNewProjectDialog by remember { mutableStateOf(false) }
     var newProjectName by remember { mutableStateOf("") }
@@ -211,8 +235,32 @@ fun RemoteControlScreen() {
     
     var isTrackpadVisible by remember { mutableStateOf(false) }
     var showVoiceSettings by remember { mutableStateOf(false) }
+    var showArtifactsSheet by remember { mutableStateOf(false) }
+    var quoteDialogText by remember { mutableStateOf<String?>(null) }
     var chatInput by remember { mutableStateOf(TextFieldValue("")) }
     val context = LocalContext.current
+
+    var showInitialNetworkPrompt by remember { mutableStateOf(state.trustedNetworks.isEmpty()) }
+    var hasPromptedForNetwork by remember { mutableStateOf(false) }
+    
+    val initialNetworkPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        if (permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true || permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true) {
+            scope.launch {
+                val ssid = ConnectionRepository.networkManager?.getCurrentSsid()
+                if (ssid != null && ssid != "<unknown ssid>") {
+                    val loc = LocationVerifier.getCurrentLocation(context)
+                    if (loc != null) {
+                        ConnectionRepository.addTrustedNetwork(TrustedNetwork(ssid, loc.latitude, loc.longitude))
+                    }
+                }
+            }
+        }
+    }
+    
+    var selectedImageBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var selectedImageBase64 by remember { mutableStateOf<String?>(null) }
     
     val photoPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
@@ -237,11 +285,8 @@ fun RemoteControlScreen() {
                         scaledBitmap.compress(Bitmap.CompressFormat.JPEG, 80, outputStream)
                         val base64Str = Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP)
                         
-                        val json = JSONObject().apply {
-                            put("event", "image")
-                            put("data", base64Str)
-                        }
-                        webSocketManager?.send(json.toString())
+                        selectedImageBitmap = scaledBitmap
+                        selectedImageBase64 = base64Str
                     }
                 } catch (e: Exception) {
                     e.printStackTrace()
@@ -251,103 +296,108 @@ fun RemoteControlScreen() {
     }
     
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
+    val appState by ConnectionRepository.state.collectAsState()
+    
+    LaunchedEffect(drawerState.isOpen) {
+        if (drawerState.isOpen) {
+            TailscaleManager.start(context)
+            TailscaleManager.startPolling()
+        } else {
+            TailscaleManager.stopPolling()
+        }
+    }
+
+    val peers by TailscaleManager.peers.collectAsState()
+    val combinedHosts = remember(discoveredHosts, peers) {
+        val map = mutableMapOf<String, RoverHost>()
+        discoveredHosts.forEach { host ->
+            map[host.name] = host
+        }
+        peers.filter { it.online }.forEach { peer ->
+            val existing = map[peer.hostname]
+            if (existing != null) {
+                map[peer.hostname] = existing.copy(tailscaleIp = peer.ip)
+            } else {
+                map[peer.hostname] = RoverHost(
+                    name = peer.hostname,
+                    tailscaleIp = peer.ip,
+                    os = "Unknown"
+                )
+            }
+        }
+        map.values.toList().sortedBy { it.name }
+    }
 
     ModalNavigationDrawer(
         drawerState = drawerState,
         drawerContent = {
-            ModalDrawerSheet(modifier = Modifier.verticalScroll(rememberScrollState())) {
+            ModalDrawerSheet(modifier = Modifier.verticalScroll(rememberScrollState()).testTag("drawer_sheet")) {
                 Spacer(modifier = Modifier.height(16.dp))
                 
-                val tsStatus by TailscaleManager.status.collectAsState()
-                
-                Text("Remote Access", modifier = Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.titleMedium)
+                Text("Hosts", modifier = Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.titleMedium)
                 HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
-                NavigationDrawerItem(
-                    label = { 
-                        Column {
-                            Text("Tailscale")
-                            Text(tsStatus, style = MaterialTheme.typography.bodySmall, color = TextSecondary)
-                        }
-                    },
-                    selected = false,
-                    onClick = {
-                        TailscaleManager.start(context)
-                    },
-                    modifier = Modifier.padding(horizontal = 12.dp)
-                )
                 
-                HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
-
-                Text("Local Connection (Wi-Fi)", modifier = Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.titleMedium)
-                if (discoveredHosts.isEmpty()) {
-                    Text("Scanning for hosts...", modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.bodyMedium, color = TextSecondary)
+                if (combinedHosts.isEmpty()) {
+                    Text("Scanning for hosts...", modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp).testTag("txt_scanning_hosts"), style = MaterialTheme.typography.bodyMedium, color = TextSecondary)
                 } else {
-                    discoveredHosts.forEach { host ->
-                        val hostUrl = "ws://${host.ip}:${host.port}"
-                        NavigationDrawerItem(
-                            label = { Text(host.name) },
-                            selected = urlInput == hostUrl && connectionStatus == "Connected",
-                            onClick = {
-                                urlInput = hostUrl
-                                ConnectionRepository.updateConnectionStatus("Connecting...")
-                                val intent = Intent(context, RoverService::class.java).apply {
-                                    action = "com.rover.remote.CONNECT"
-                                    putExtra("url", hostUrl)
-                                }
-                                androidx.core.content.ContextCompat.startForegroundService(context, intent)
-                                scope.launch { drawerState.close() }
-                            },
-                            modifier = Modifier.padding(horizontal = 12.dp)
-                        )
-                    }
-                }
-                
-                val peers by TailscaleManager.peers.collectAsState()
-                if (peers.isNotEmpty()) {
-                    Text("Remote Connection (Tailscale)", modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.titleSmall)
-                    val disableTailscalePeers = discoveredHosts.isNotEmpty() && connectionStatus == "Connected"
-                    peers.filter { it.online }.forEach { peer ->
+                    combinedHosts.forEach { host ->
+                        val isConnected = appState.connectedHostName == host.name && appState.connectionStatus == "Connected"
+                        
                         NavigationDrawerItem(
                             label = { 
                                 Row(verticalAlignment = Alignment.CenterVertically) {
-                                    val indicatorColor = if (disableTailscalePeers) TextTertiary else StatusConnected
-                                    val textColor = if (disableTailscalePeers) TextTertiary else Color.Unspecified
+                                    val indicatorColor = if (isConnected) StatusConnected else TextTertiary
+                                    val textColor = if (isConnected) MaterialTheme.colorScheme.primary else Color.Unspecified
                                     Box(modifier = Modifier.size(8.dp).background(indicatorColor, shape = androidx.compose.foundation.shape.CircleShape))
                                     Spacer(modifier = Modifier.width(8.dp))
-                                    Text(peer.hostname, color = textColor)
+                                    Text(host.name, color = textColor)
+                                    
+                                    if (host.localIp != null) {
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text("Wi-Fi", style = MaterialTheme.typography.labelSmall, color = TextSecondary, modifier = Modifier.background(MaterialTheme.colorScheme.surfaceVariant, shape = androidx.compose.foundation.shape.RoundedCornerShape(4.dp)).padding(horizontal = 4.dp, vertical = 2.dp))
+                                    } else if (host.tailscaleIp != null) {
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text("Tailscale", style = MaterialTheme.typography.labelSmall, color = TextSecondary, modifier = Modifier.background(MaterialTheme.colorScheme.surfaceVariant, shape = androidx.compose.foundation.shape.RoundedCornerShape(4.dp)).padding(horizontal = 4.dp, vertical = 2.dp))
+                                    }
                                 }
                             },
-                            selected = false,
+                            selected = isConnected,
                             onClick = {
-                                if (disableTailscalePeers) return@NavigationDrawerItem
-                                try {
-                                    android.util.Log.e("RoverClick", "Clicked peer: ${peer.hostname}, IP: ${peer.ip}")
-                                    if (connectionStatus == "Connected") {
+                                if (isConnected) {
+                                    scope.launch { drawerState.close() }
+                                    return@NavigationDrawerItem
+                                }
+                                
+                                val targetUrl = if (host.localIp != null) {
+                                    "ws://${host.localIp}:${host.localPort}"
+                                } else if (host.tailscaleIp != null) {
+                                    val formattedHost = if (host.tailscaleIp.contains(":") && !host.tailscaleIp.startsWith("[")) "[${host.tailscaleIp}]" else host.tailscaleIp
+                                    "${Config.WS_SCHEME}$formattedHost:${Config.TSNET_PROXY_PORT}"
+                                } else {
+                                    ""
+                                }
+                                
+                                if (targetUrl.isNotEmpty()) {
+                                    if (appState.connectionStatus == "Connected") {
                                         webSocketManager?.disconnect()
                                         ConnectionRepository.updateConnectionStatus("Disconnected")
                                     }
+                                    
+
+                                    ConnectionRepository.updateConnectedHostName(host.name)
                                     ConnectionRepository.updateConnectionStatus("Connecting...")
-                                    val targetHost = if (peer.ip.isNotBlank()) peer.ip else peer.hostname
-                                    android.util.Log.e("RoverClick", "Target host: $targetHost")
-                                    val formattedHost = if (targetHost.contains(":") && !targetHost.startsWith("[")) "[$targetHost]" else targetHost
+                                    
                                     val intent = Intent(context, RoverService::class.java).apply {
                                         action = "com.rover.remote.CONNECT"
-                                        putExtra("url", "ws://$formattedHost:8765")
+                                        putExtra("url", targetUrl)
                                     }
                                     androidx.core.content.ContextCompat.startForegroundService(context, intent)
-                                    android.util.Log.e("RoverClick", "Started service, closing drawer...")
-                                    scope.launch { 
-                                        drawerState.close() 
-                                        android.util.Log.e("RoverClick", "Drawer closed.")
-                                    }
-                                } catch (e: Exception) {
-                                    android.util.Log.e("RoverClick", "Exception in onClick", e)
+                                    scope.launch { drawerState.close() }
                                 }
                             },
-                            modifier = Modifier.padding(horizontal = 12.dp)
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp).testTag("drawer_host_${host.name}")
                         )
                     }
-                    Spacer(modifier = Modifier.height(8.dp))
                 }
                 
                 HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
@@ -363,7 +413,7 @@ fun RemoteControlScreen() {
                         showNewProjectDialog = true 
                         scope.launch { drawerState.close() }
                     },
-                    modifier = Modifier.padding(horizontal = 12.dp),
+                    modifier = Modifier.padding(horizontal = 12.dp).testTag("btn_new_project"),
                     colors = NavigationDrawerItemDefaults.colors(
                         unselectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
                         unselectedTextColor = MaterialTheme.colorScheme.onPrimaryContainer
@@ -372,6 +422,7 @@ fun RemoteControlScreen() {
                 
                 if (showNewProjectDialog) {
                     AlertDialog(
+                        modifier = Modifier.testTag("dialog_create_project"),
                         onDismissRequest = { showNewProjectDialog = false },
                         title = { Text("Create Project") },
                         text = {
@@ -382,12 +433,14 @@ fun RemoteControlScreen() {
                                     value = newProjectName,
                                     onValueChange = { newProjectName = it },
                                     label = { Text("Project Name") },
+                                    modifier = Modifier.testTag("input_create_project_name"),
                                     singleLine = true
                                 )
                             }
                         },
                         confirmButton = {
                             TextButton(
+                                modifier = Modifier.testTag("btn_create_project_confirm"),
                                 onClick = { 
                                     if (newProjectName.isNotBlank()) {
                                         val trimmedName = newProjectName.trim()
@@ -415,7 +468,7 @@ fun RemoteControlScreen() {
                             }
                         },
                         dismissButton = {
-                            TextButton(onClick = { showNewProjectDialog = false }) {
+                            TextButton(onClick = { showNewProjectDialog = false }, modifier = Modifier.testTag("btn_create_project_cancel")) {
                                 Text("Cancel")
                             }
                         }
@@ -441,7 +494,7 @@ fun RemoteControlScreen() {
                                 ConnectionRepository.webSocketManager?.send(payload.toString())
                                 scope.launch { drawerState.close() } 
                             },
-                            modifier = Modifier.padding(horizontal = 12.dp)
+                            modifier = Modifier.padding(horizontal = 12.dp).testTag("drawer_project_${proj}")
                         )
                     }
                     
@@ -450,7 +503,7 @@ fun RemoteControlScreen() {
                             label = { Text(if (showMoreProjects) "Show Less" else "More Projects...") },
                             selected = false,
                             onClick = { showMoreProjects = !showMoreProjects },
-                            modifier = Modifier.padding(horizontal = 12.dp)
+                            modifier = Modifier.padding(horizontal = 12.dp).testTag("btn_more_projects_toggle")
                         )
                         
                         if (showMoreProjects) {
@@ -467,7 +520,7 @@ fun RemoteControlScreen() {
                                         ConnectionRepository.webSocketManager?.send(payload.toString())
                                         scope.launch { drawerState.close() } 
                                     },
-                                    modifier = Modifier.padding(horizontal = 12.dp)
+                                    modifier = Modifier.padding(horizontal = 12.dp).testTag("drawer_project_${proj}")
                                 )
                             }
                         }
@@ -483,39 +536,11 @@ fun RemoteControlScreen() {
                         scope.launch { drawerState.close() }
                         showSettingsDialog = true
                     },
-                    modifier = Modifier.padding(horizontal = 12.dp)
+                    modifier = Modifier.padding(horizontal = 12.dp).testTag("btn_drawer_settings")
                 )
                 Spacer(modifier = Modifier.weight(1f))
                 
-                Column(modifier = Modifier.padding(16.dp)) {
-                    OutlinedTextField(
-                        value = urlInput,
-                        onValueChange = { urlInput = it },
-                        label = { Text("Manual WebSocket URL") },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true,
-                        enabled = connectionStatus == "Disconnected"
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Button(
-                        onClick = {
-                            if (connectionStatus == "Connected") {
-                                webSocketManager?.disconnect()
-                                ConnectionRepository.updateConnectionStatus("Disconnected")
-                            } else {
-                                ConnectionRepository.updateConnectionStatus("Connecting...")
-                                val intent = Intent(context, RoverService::class.java).apply {
-                                    action = "com.rover.remote.CONNECT"
-                                    putExtra("url", urlInput)
-                                }
-                                androidx.core.content.ContextCompat.startForegroundService(context, intent)
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(if (connectionStatus == "Connected") "Disconnect" else "Connect")
-                    }
-                }
+
             }
         }
     ) {
@@ -523,17 +548,50 @@ fun RemoteControlScreen() {
             topBar = {
                 Column {
                     TopAppBar(
+                        modifier = Modifier.testTag("top_app_bar"),
                         title = { 
-                            Column {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text(
                                     text = if (currentProject.isNotEmpty()) currentProject else "Tether",
                                     style = MaterialTheme.typography.titleMedium,
-                                    color = MaterialTheme.colorScheme.onSurface
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    modifier = Modifier.testTag("txt_top_app_bar_title")
                                 )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                
+                                AnimatedContent(
+                                    targetState = connectionStatus,
+                                    transitionSpec = {
+                                        fadeIn(animationSpec = tween(300)) togetherWith fadeOut(animationSpec = tween(300))
+                                    },
+                                    label = "connectionBadge"
+                                ) { status ->
+                                    if (status == "Connected") {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(8.dp)
+                                                .clip(androidx.compose.foundation.shape.CircleShape)
+                                                .background(StatusConnected)
+                                                .testTag("status_indicator_dot")
+                                        )
+                                    } else {
+                                        Surface(
+                                            shape = RoundedCornerShape(16.dp),
+                                            color = if (status == "Connecting...") StatusConnecting.copy(alpha=0.2f) else StatusDisconnected.copy(alpha=0.2f),
+                                        ) {
+                                            Text(
+                                                text = status,
+                                                color = if (status == "Connecting...") StatusConnecting else StatusDisconnected,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                                            )
+                                        }
+                                    }
+                                }
                             }
                         },
                         navigationIcon = {
-                            IconButton(onClick = { scope.launch { drawerState.open() } }) {
+                            IconButton(onClick = { scope.launch { drawerState.open() } }, modifier = Modifier.testTag("btn_drawer_menu")) {
                                 Icon(Icons.Default.Menu, contentDescription = "Menu")
                             }
                         },
@@ -542,7 +600,8 @@ fun RemoteControlScreen() {
                                 Text(
                                     text = "Turbo",
                                     style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurface
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    modifier = Modifier.testTag("txt_turbo_mode_label")
                                 )
                                 Spacer(modifier = Modifier.width(4.dp))
                                 Switch(
@@ -550,13 +609,16 @@ fun RemoteControlScreen() {
                                     onCheckedChange = { isChecked ->
                                         ConnectionRepository.updateTurboMode(isChecked)
                                     },
-                                    modifier = Modifier.scale(0.7f)
+                                    modifier = Modifier.scale(0.7f).testTag("switch_turbo_mode")
                                 )
                             }
-                            IconButton(onClick = { showVoiceSettings = true }) {
+                            IconButton(onClick = { showVoiceSettings = true }, modifier = Modifier.testTag("btn_voice_settings")) {
                                 Icon(Icons.Default.Settings, contentDescription = "Settings")
                             }
-                            IconButton(onClick = { isTrackpadVisible = true }) {
+                            IconButton(onClick = { showArtifactsSheet = true }, modifier = Modifier.testTag("btn_artifacts_sheet")) {
+                                Icon(Icons.Default.List, contentDescription = "Artifacts")
+                            }
+                            IconButton(onClick = { isTrackpadVisible = true }, modifier = Modifier.testTag("btn_trackpad_toggle")) {
                                 Icon(Icons.Default.Edit, contentDescription = "Trackpad")
                             }
                         },
@@ -564,49 +626,7 @@ fun RemoteControlScreen() {
                             containerColor = DarkBackground
                         )
                     )
-                    // Slim status bar
-                    val statusBarColor = when (connectionStatus) {
-                        "Connected" -> StatusConnected
-                        "Connecting..." -> StatusConnecting
-                        else -> StatusDisconnected
-                    }
-                    val statusText = when {
-                        connectionStatus == "Connected" && currentProject.isNotEmpty() -> {
-                            var text = "Connected · $currentProject"
-                            if (state.activeConversationId.isNotEmpty()) {
-                                text += " · Agent: ${state.activeConversationId.take(8)}"
-                            }
-                            text
-                        }
-                        connectionStatus == "Connected" -> {
-                            var text = "Connected"
-                            if (state.activeConversationId.isNotEmpty()) {
-                                text += " · Agent: ${state.activeConversationId.take(8)}"
-                            }
-                            text
-                        }
-                        connectionStatus == "Connecting..." -> "Connecting..."
-                        else -> "Disconnected"
-                    }
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(DarkSurface)
-                            .padding(horizontal = 16.dp, vertical = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(6.dp)
-                                .background(statusBarColor, shape = androidx.compose.foundation.shape.CircleShape)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = statusText,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = TextSecondary
-                        )
-                    }
+                    // Slim status bar removed
                 }
             }
         ) { padding ->
@@ -620,6 +640,16 @@ fun RemoteControlScreen() {
                 
                 if (showVoiceSettings) {
                     VoiceSettingsBottomSheet(onDismiss = { showVoiceSettings = false })
+                }
+                if (showArtifactsSheet) {
+                    ArtifactsBottomSheet(
+                        artifacts = state.artifactHistory.values.toList(),
+                        onDismiss = { showArtifactsSheet = false },
+                        onArtifactSelected = {
+                            ConnectionRepository.setArtifact(it)
+                            showArtifactsSheet = false
+                        }
+                    )
                 }
                 val infiniteTransition = rememberInfiniteTransition()
                 val color1 by infiniteTransition.animateColor(
@@ -669,9 +699,58 @@ fun RemoteControlScreen() {
                         .align(Alignment.TopCenter)
                 )
                 
+                if (showInitialNetworkPrompt && !hasPromptedForNetwork) {
+                    AlertDialog(
+                        onDismissRequest = { 
+                            showInitialNetworkPrompt = false
+                            hasPromptedForNetwork = true
+                        },
+                        title = { Text("Configure Home Network?") },
+                        text = { Text("It looks like you haven't set up a trusted home network yet. This is required for automatic local discovery of the Rover Receiver. Are you at home right now, and would you like to trust this Wi-Fi network?") },
+                        confirmButton = {
+                            TextButton(onClick = {
+                                showInitialNetworkPrompt = false
+                                hasPromptedForNetwork = true
+                                initialNetworkPermissionLauncher.launch(arrayOf(
+                                    Manifest.permission.ACCESS_FINE_LOCATION,
+                                    Manifest.permission.ACCESS_COARSE_LOCATION
+                                ))
+                            }) {
+                                Text("Yes, Trust Network")
+                            }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { 
+                                showInitialNetworkPrompt = false
+                                hasPromptedForNetwork = true
+                            }) {
+                                Text("Not Right Now")
+                            }
+                        }
+                    )
+                }
+                
                 if (showSettingsDialog) {
                     var biometricsEnabled by remember { mutableStateOf(SecurityManager.isBiometricsEnabled) }
+                    
+                    val permissionLauncher = rememberLauncherForActivityResult(
+                        ActivityResultContracts.RequestMultiplePermissions()
+                    ) { permissions ->
+                        if (permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true || permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true) {
+                            scope.launch {
+                                val ssid = ConnectionRepository.networkManager?.getCurrentSsid()
+                                if (ssid != null && ssid != "<unknown ssid>") {
+                                    val loc = LocationVerifier.getCurrentLocation(context)
+                                    if (loc != null) {
+                                        ConnectionRepository.addTrustedNetwork(TrustedNetwork(ssid, loc.latitude, loc.longitude))
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     AlertDialog(
+                        modifier = Modifier.testTag("dialog_settings"),
                         onDismissRequest = { showSettingsDialog = false },
                         title = { Text("Settings") },
                         text = {
@@ -687,13 +766,54 @@ fun RemoteControlScreen() {
                                         onCheckedChange = { 
                                             biometricsEnabled = it
                                             SecurityManager.isBiometricsEnabled = it
-                                        }
+                                        },
+                                        modifier = Modifier.testTag("switch_biometrics")
                                     )
+                                }
+                                
+                                HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+                                
+                                Text("Geofenced Trusted Networks", style = MaterialTheme.typography.titleSmall)
+                                Text(
+                                    "Your location data and trusted networks are stored securely on this device. They never leave your phone and are never sent to any cloud server.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = TextSecondary,
+                                    modifier = Modifier.padding(vertical = 8.dp)
+                                )
+                                
+                                appState.trustedNetworks.forEach { net ->
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Column {
+                                            Text(net.ssid, style = MaterialTheme.typography.bodyMedium)
+                                            Text("Lat: ${"%.4f".format(net.lat)}, Lng: ${"%.4f".format(net.lng)}", style = MaterialTheme.typography.labelSmall, color = TextTertiary)
+                                        }
+                                        IconButton(onClick = { ConnectionRepository.removeTrustedNetwork(net.ssid) }) {
+                                            Icon(Icons.Default.Delete, contentDescription = "Remove")
+                                        }
+                                    }
+                                }
+                                
+                                TextButton(
+                                    onClick = {
+                                        permissionLauncher.launch(arrayOf(
+                                            Manifest.permission.ACCESS_FINE_LOCATION,
+                                            Manifest.permission.ACCESS_COARSE_LOCATION
+                                        ))
+                                    },
+                                    modifier = Modifier.padding(top = 8.dp)
+                                ) {
+                                    Icon(Icons.Default.Add, contentDescription = null)
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("Add Current Wi-Fi")
                                 }
                             }
                         },
                         confirmButton = {
-                            TextButton(onClick = { showSettingsDialog = false }) {
+                            TextButton(onClick = { showSettingsDialog = false }, modifier = Modifier.testTag("btn_settings_close")) {
                                 Text("Close")
                             }
                         }
@@ -719,7 +839,7 @@ fun RemoteControlScreen() {
                             visible = chatMessages.isEmpty(),
                             enter = androidx.compose.animation.fadeIn(animationSpec = tween(1000)),
                             exit = androidx.compose.animation.fadeOut(animationSpec = tween(500)),
-                            modifier = Modifier.align(Alignment.Center)
+                            modifier = Modifier.align(Alignment.Center).testTag("chat_empty_state")
                         ) {
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                 Text(
@@ -730,64 +850,68 @@ fun RemoteControlScreen() {
                                 Text(
                                     "Welcome to Tether",
                                     style = MaterialTheme.typography.titleLarge,
-                                    color = TextPrimary
+                                    color = TextPrimary,
+                                    modifier = Modifier.testTag("txt_welcome_title")
                                 )
                                 Spacer(modifier = Modifier.height(8.dp))
                                 Text(
                                     if (connectionStatus == "Connected") "Ready for Rover" else "Connecting...",
                                     style = MaterialTheme.typography.bodyMedium,
-                                    color = if (connectionStatus == "Connected") Amber else TextSecondary
+                                    color = if (connectionStatus == "Connected") Amber else TextSecondary,
+                                    modifier = Modifier.testTag("txt_welcome_subtitle")
                                 )
                             }
                         }
-
-                        LazyColumn(
-                            state = listState,
-                            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
-                            reverseLayout = true,
-                            verticalArrangement = Arrangement.spacedBy(2.dp)
-                        ) {
-                            val reversed = chatMessages.asReversed()
-                            items(reversed.size) { index ->
-                                val msg = reversed[index]
-                                val isUser = msg.role == "user"
-                                val prevMsg = if (index > 0) reversed[index - 1] else null
-                                val showRoleLabel = prevMsg == null || prevMsg.role != msg.role
-                                
-                                Column(
-                                    modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
-                                    horizontalAlignment = if (isUser) Alignment.End else Alignment.Start
-                                ) {
-                                    if (showRoleLabel) {
-                                        Text(
-                                            text = if (isUser) "You" else "Rover",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = if (isUser) AccentBlue.copy(alpha = 0.7f) else Amber.copy(alpha = 0.7f),
-                                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp)
-                                        )
-                                    }
-                                    Surface(
-                                        shape = if (isUser) {
-                                            RoundedCornerShape(16.dp, 16.dp, 4.dp, 16.dp)
-                                        } else {
-                                            RoundedCornerShape(16.dp, 16.dp, 16.dp, 4.dp)
-                                        },
-                                        color = if (isUser) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.secondaryContainer,
-                                        modifier = Modifier.fillMaxWidth(0.85f)
+                        SelectionContainer {
+                            LazyColumn(
+                                state = listState,
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                                reverseLayout = true,
+                                verticalArrangement = Arrangement.spacedBy(2.dp)
+                            ) {
+                                val reversed = chatMessages.asReversed()
+                                items(reversed.size) { index ->
+                                    val msg = reversed[index]
+                                    val isUser = msg.role == "user"
+                                    val prevMsg = if (index > 0) reversed[index - 1] else null
+                                    val showRoleLabel = prevMsg == null || prevMsg.role != msg.role
+                                    
+                                    Column(
+                                        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                                        horizontalAlignment = if (isUser) Alignment.End else Alignment.Start
                                     ) {
-                                        if (isUser) {
+                                        if (showRoleLabel) {
                                             Text(
-                                                text = msg.message,
-                                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-                                                style = MaterialTheme.typography.bodyMedium,
-                                                color = MaterialTheme.colorScheme.onPrimaryContainer
+                                                text = if (isUser) "You" else "Rover",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = if (isUser) AccentBlue.copy(alpha = 0.7f) else Amber.copy(alpha = 0.7f),
+                                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp)
                                             )
-                                        } else {
-                                            MarkdownText(
-                                                markdown = msg.message,
-                                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-                                                textColor = MaterialTheme.colorScheme.onSecondaryContainer
-                                            )
+                                        }
+                                        
+                                        Surface(
+                                            shape = if (showRoleLabel) {
+                                                if (isUser) RoundedCornerShape(16.dp, 16.dp, 4.dp, 16.dp) else RoundedCornerShape(16.dp, 16.dp, 16.dp, 4.dp)
+                                            } else {
+                                                RoundedCornerShape(16.dp)
+                                            },
+                                            color = if (isUser) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.secondaryContainer,
+                                            modifier = Modifier.fillMaxWidth(0.85f)
+                                        ) {
+                                            if (isUser) {
+                                                Text(
+                                                    text = msg.message,
+                                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                                                    style = MaterialTheme.typography.bodyMedium,
+                                                    color = MaterialTheme.colorScheme.onPrimaryContainer
+                                                )
+                                            } else {
+                                                MarkdownText(
+                                                    markdown = msg.message,
+                                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                                                    textColor = MaterialTheme.colorScheme.onSecondaryContainer
+                                                )
+                                            }
                                         }
                                     }
                                 }
@@ -1299,6 +1423,41 @@ fun RemoteControlScreen() {
                     }
 
                     // Chat Input box
+                    if (selectedImageBitmap != null) {
+                        Box(
+                            modifier = Modifier
+                                .padding(horizontal = 16.dp, vertical = 8.dp)
+                                .size(120.dp)
+                        ) {
+                            Image(
+                                bitmap = selectedImageBitmap!!.asImageBitmap(),
+                                contentDescription = "Attached Image",
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .clip(RoundedCornerShape(8.dp))
+                            )
+                            IconButton(
+                                onClick = { 
+                                    selectedImageBitmap = null
+                                    selectedImageBase64 = null
+                                },
+                                modifier = Modifier
+                                    .align(Alignment.TopEnd)
+                                    .padding(4.dp)
+                                    .size(24.dp)
+                                    .background(Color.Black.copy(alpha = 0.5f), androidx.compose.foundation.shape.CircleShape)
+                            ) {
+                                Icon(
+                                    Icons.Default.Close,
+                                    contentDescription = "Remove image",
+                                    tint = Color.White,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        }
+                    }
+
                     Row(
                         modifier = Modifier.fillMaxWidth().padding(8.dp),
                         verticalAlignment = Alignment.CenterVertically
@@ -1309,18 +1468,63 @@ fun RemoteControlScreen() {
                             } catch (e: Exception) {
                                 e.printStackTrace()
                             }
-                        }) {
+                        }, modifier = Modifier.testTag("btn_attach_image")) {
                             Icon(Icons.Default.Add, contentDescription = "Attach Image")
                         }
                         OutlinedTextField(
                             value = chatInput,
                             onValueChange = { chatInput = it },
-                            modifier = Modifier.weight(1f),
+                            modifier = Modifier.weight(1f).testTag("input_chat_message"),
                             placeholder = { Text("Message Rover...") },
                             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                             keyboardActions = KeyboardActions(
                                 onSend = {
-                                    if (chatInput.text.isNotBlank() && connectionStatus == "Connected") {
+                                    if ((chatInput.text.isNotBlank() || selectedImageBase64 != null) && connectionStatus == "Connected") {
+                                        if (selectedImageBase64 != null) {
+                                            val imageJson = JSONObject().apply {
+                                                put("event", "image")
+                                                put("data", selectedImageBase64)
+                                            }
+                                            ConnectionRepository.webSocketManager?.send(imageJson.toString())
+                                            selectedImageBitmap = null
+                                            selectedImageBase64 = null
+                                        }
+                                        if (chatInput.text.isNotBlank()) {
+                                            val json = JSONObject().apply {
+                                                put("event", "chat")
+                                                put("message", chatInput.text)
+                                                put("project", ConnectionRepository.state.value.currentProject)
+                                            }
+                                            ConnectionRepository.webSocketManager?.send(json.toString())
+                                            chatInput = TextFieldValue("")
+                                        }
+                                        ConnectionRepository.setThinking(true)
+                                    }
+                                }
+                            )
+                        )
+                        IconButton(onClick = {
+                            val intent = Intent(context, RoverService::class.java).apply {
+                                action = "com.rover.remote.TOGGLE_MIC"
+                            }
+                            context.startService(intent)
+                        }, modifier = Modifier.testTag("btn_toggle_mic")) {
+                            val iconColor = if (isMicListening) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+                            Icon(Icons.Default.Mic, contentDescription = "Toggle Mic", tint = iconColor)
+                        }
+                        IconButton(
+                            onClick = {
+                                if ((chatInput.text.isNotBlank() || selectedImageBase64 != null) && connectionStatus == "Connected") {
+                                    if (selectedImageBase64 != null) {
+                                        val imageJson = JSONObject().apply {
+                                            put("event", "image")
+                                            put("data", selectedImageBase64)
+                                        }
+                                        ConnectionRepository.webSocketManager?.send(imageJson.toString())
+                                        selectedImageBitmap = null
+                                        selectedImageBase64 = null
+                                    }
+                                    if (chatInput.text.isNotBlank()) {
                                         val json = JSONObject().apply {
                                             put("event", "chat")
                                             put("message", chatInput.text)
@@ -1328,38 +1532,25 @@ fun RemoteControlScreen() {
                                         }
                                         ConnectionRepository.webSocketManager?.send(json.toString())
                                         chatInput = TextFieldValue("")
-                                        ConnectionRepository.setThinking(true)
                                     }
-                                }
-                            )
-                        )
-                        IconButton(
-                            onClick = {
-                                if (chatInput.text.isNotBlank() && connectionStatus == "Connected" && !isThinking) {
-                                    val json = JSONObject().apply {
-                                        put("event", "chat")
-                                        put("message", chatInput.text)
-                                        put("project", ConnectionRepository.state.value.currentProject)
-                                    }
-                                    ConnectionRepository.webSocketManager?.send(json.toString())
-                                    chatInput = TextFieldValue("")
                                     ConnectionRepository.setThinking(true)
                                 }
                             },
                             colors = IconButtonDefaults.iconButtonColors(
-                                containerColor = if (isThinking) DarkSurfaceVariant else MaterialTheme.colorScheme.primary,
+                                containerColor = if (isThinking && chatInput.text.isBlank() && selectedImageBase64 == null) DarkSurfaceVariant else MaterialTheme.colorScheme.primary,
                                 disabledContainerColor = DarkSurfaceVariant
                             ),
-                            enabled = !isThinking && connectionStatus == "Connected"
+                            enabled = connectionStatus == "Connected" && (chatInput.text.isNotBlank() || selectedImageBase64 != null),
+                            modifier = Modifier.testTag("btn_send_chat")
                         ) {
                             AnimatedContent(
-                                targetState = isThinking,
+                                targetState = isThinking && chatInput.text.isBlank() && selectedImageBase64 == null,
                                 transitionSpec = {
                                     fadeIn(animationSpec = tween(150)) togetherWith fadeOut(animationSpec = tween(150))
                                 },
                                 label = "sendButtonIcon"
-                            ) { thinking ->
-                                if (thinking) {
+                            ) { showSpinner ->
+                                if (showSpinner) {
                                     CircularProgressIndicator(
                                         modifier = Modifier.size(20.dp),
                                         color = Amber,
@@ -1378,7 +1569,7 @@ fun RemoteControlScreen() {
                     visible = currentArtifact != null,
                     enter = slideInHorizontally(initialOffsetX = { it }),
                     exit = slideOutHorizontally(targetOffsetX = { it }),
-                    modifier = Modifier.align(Alignment.CenterEnd).fillMaxHeight().fillMaxWidth(0.92f)
+                    modifier = Modifier.align(Alignment.CenterEnd).fillMaxHeight().fillMaxWidth(0.92f).testTag("artifact_panel")
                 ) {
                     Surface(
                         color = DarkSurface,
@@ -1399,11 +1590,12 @@ fun RemoteControlScreen() {
                                         text = currentArtifact?.title ?: "",
                                         style = MaterialTheme.typography.titleMedium,
                                         color = TextPrimary,
-                                        maxLines = 2
+                                        maxLines = 2,
+                                        modifier = Modifier.testTag("txt_artifact_title")
                                     )
                                 }
                                 Spacer(modifier = Modifier.width(8.dp))
-                                IconButton(onClick = { ConnectionRepository.setArtifact(null) }) {
+                                IconButton(onClick = { ConnectionRepository.setArtifact(null) }, modifier = Modifier.testTag("btn_close_artifact")) {
                                     Icon(Icons.Default.Close, contentDescription = "Close", tint = TextSecondary)
                                 }
                             }
@@ -1414,12 +1606,80 @@ fun RemoteControlScreen() {
                                     .weight(1f)
                                     .verticalScroll(rememberScrollState())
                                     .padding(16.dp)
+                                    .testTag("container_artifact_content")
                             ) {
-                                MarkdownText(
-                                    markdown = currentArtifact?.content ?: "",
-                                    textColor = TextPrimary,
-                                    codeBackground = DarkSurfaceElevated
-                                )
+                                val androidClipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                androidx.compose.runtime.DisposableEffect(currentArtifact) {
+                                    val listener = android.content.ClipboardManager.OnPrimaryClipChangedListener {
+                                        val clip = androidClipboard.primaryClip
+                                        if (clip != null && clip.itemCount > 0) {
+                                            val text = clip.getItemAt(0).text?.toString()
+                                            if (!text.isNullOrEmpty()) {
+                                                quoteDialogText = text
+                                            }
+                                        }
+                                    }
+                                    androidClipboard.addPrimaryClipChangedListener(listener)
+                                    onDispose {
+                                        androidClipboard.removePrimaryClipChangedListener(listener)
+                                    }
+                                }
+                                
+                                SelectionContainer {
+                                    MarkdownText(
+                                        markdown = currentArtifact?.content ?: "",
+                                        textColor = TextPrimary,
+                                        codeBackground = DarkSurfaceElevated
+                                    )
+                                }
+                                
+                                if (quoteDialogText != null) {
+                                    var noteText by remember { mutableStateOf("") }
+                                    AlertDialog(
+                                        onDismissRequest = { quoteDialogText = null },
+                                        title = { Text("Reply to Section", color = MaterialTheme.colorScheme.onSurface) },
+                                        text = {
+                                            Column {
+                                                Text(
+                                                    text = "\"${quoteDialogText}\"",
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                    fontStyle = androidx.compose.ui.text.font.FontStyle.Italic,
+                                                    modifier = Modifier.padding(bottom = 8.dp)
+                                                )
+                                                OutlinedTextField(
+                                                    value = noteText,
+                                                    onValueChange = { noteText = it },
+                                                    label = { Text("Add a note...") },
+                                                    modifier = Modifier.fillMaxWidth(),
+                                                    textStyle = androidx.compose.ui.text.TextStyle(color = MaterialTheme.colorScheme.onSurface)
+                                                )
+                                            }
+                                        },
+                                        confirmButton = {
+                                            Button(onClick = {
+                                                val msg = "> ${quoteDialogText?.replace("\n", "\n> ")}\n\n$noteText"
+                                                val webSocketManager = ConnectionRepository.webSocketManager
+                                                webSocketManager?.send(org.json.JSONObject().apply {
+                                                    put("event", "chat")
+                                                    put("message", msg)
+                                                }.toString())
+                                                ConnectionRepository.setArtifact(null) // Close artifact to show chat
+                                                quoteDialogText = null
+                                            }) {
+                                                Text("Send")
+                                            }
+                                        },
+                                        dismissButton = {
+                                            TextButton(onClick = { quoteDialogText = null }) {
+                                                Text("Cancel")
+                                            }
+                                        },
+                                        containerColor = DarkSurfaceElevated,
+                                        titleContentColor = MaterialTheme.colorScheme.onSurface,
+                                        textContentColor = MaterialTheme.colorScheme.onSurface
+                                    )
+                                }
                             }
                         }
                     }
@@ -1431,14 +1691,14 @@ fun RemoteControlScreen() {
         if (isTrackpadVisible) {
             Dialog(onDismissRequest = { isTrackpadVisible = false }) {
                 Surface(
-                    modifier = Modifier.fillMaxWidth().fillMaxHeight(0.8f),
+                    modifier = Modifier.fillMaxWidth().fillMaxHeight(0.8f).testTag("dialog_trackpad"),
                     shape = RoundedCornerShape(16.dp),
                     color = MaterialTheme.colorScheme.surface
                 ) {
                     Column(modifier = Modifier.padding(16.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text("Remote Control", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
-                            IconButton(onClick = { isTrackpadVisible = false }) {
+                            IconButton(onClick = { isTrackpadVisible = false }, modifier = Modifier.testTag("btn_close_trackpad")) {
                                 Icon(Icons.Default.Close, contentDescription = "Close")
                             }
                         }
@@ -1483,7 +1743,7 @@ fun RemoteControlScreen() {
                                 remoteText = newValue
                             },
                             label = { Text("Live Typing (Mirrors to PC)") },
-                            modifier = Modifier.fillMaxWidth()
+                            modifier = Modifier.fillMaxWidth().testTag("input_live_typing")
                         )
                         
                         Spacer(modifier = Modifier.height(16.dp))
@@ -1494,6 +1754,7 @@ fun RemoteControlScreen() {
                                 .fillMaxWidth()
                                 .weight(1f)
                                 .background(DarkSurfaceVariant, RoundedCornerShape(8.dp))
+                                .testTag("trackpad_touch_area")
                                 .pointerInput(Unit) {
                                     awaitPointerEventScope {
                                         while (true) {
@@ -1586,23 +1847,23 @@ fun RemoteControlScreen() {
 class WebSocketManager {
     private var webSocket: WebSocket? = null
     private val client: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
-        .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
-        .writeTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
-        .pingInterval(15, java.util.concurrent.TimeUnit.SECONDS)
+        .connectTimeout(Config.HTTP_CONNECT_TIMEOUT_SEC, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(Config.HTTP_READ_TIMEOUT_SEC, java.util.concurrent.TimeUnit.SECONDS)
+        .writeTimeout(Config.HTTP_WRITE_TIMEOUT_SEC, java.util.concurrent.TimeUnit.SECONDS)
+        .pingInterval(Config.WS_PING_INTERVAL_SEC, java.util.concurrent.TimeUnit.SECONDS)
         .build()
 
     fun connect(url: String, listener: WebSocketListener) {
         disconnect()
         
         var finalUrl = url
-        if (url.contains(":8765") || url.contains("100.")) {
+        if (url.contains(Config.TAILSCALE_PORT_CHECK) || url.contains(Config.TAILSCALE_IP_PREFIX)) {
             try {
                 val hostPort = url.substringAfter("://").substringBefore("/")
                 synchronized(WebSocketManager::class.java) {
                     tsnet_wrapper.Tsnet_wrapper.setProxyTarget(hostPort)
                 }
-                finalUrl = url.replace(hostPort, "127.0.0.1:1080")
+                finalUrl = url.replace(hostPort, Config.LOCAL_PROXY_ADDRESS)
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -1613,7 +1874,7 @@ class WebSocketManager {
     }
 
     fun disconnect() {
-        webSocket?.close(1000, "Disconnect")
+        webSocket?.close(Config.WS_NORMAL_CLOSURE_CODE, "Disconnect")
         webSocket = null
     }
 
@@ -1623,6 +1884,10 @@ class WebSocketManager {
 
     fun send(message: String): Boolean {
         return webSocket?.send(message) ?: false
+    }
+
+    fun sendBytes(data: okio.ByteString): Boolean {
+        return webSocket?.send(data) ?: false
     }
 }
 
@@ -1775,7 +2040,8 @@ fun VoiceSettingsBottomSheet(
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
-        sheetState = sheetState
+        sheetState = sheetState,
+        modifier = Modifier.testTag("bottom_sheet_voice_settings")
     ) {
         Column(
             modifier = Modifier
@@ -1789,7 +2055,8 @@ fun VoiceSettingsBottomSheet(
             // Dropdown for Voice SID
             ExposedDropdownMenuBox(
                 expanded = expanded,
-                onExpandedChange = { expanded = !expanded }
+                onExpandedChange = { expanded = !expanded },
+                modifier = Modifier.testTag("dropdown_voice_selector")
             ) {
                 OutlinedTextField(
                     value = "Voice ID: $selectedSid",
@@ -1810,7 +2077,8 @@ fun VoiceSettingsBottomSheet(
                                 selectedSid = sid
                                 ttsManager?.setVoice(sid)
                                 expanded = false
-                            }
+                            },
+                            modifier = Modifier.testTag("item_voice_sid_$sid")
                         )
                     }
                 }
@@ -1822,7 +2090,7 @@ fun VoiceSettingsBottomSheet(
                 value = previewText,
                 onValueChange = { previewText = it },
                 label = { Text("Preview Text") },
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth().testTag("input_voice_preview_text")
             )
             
             Spacer(modifier = Modifier.height(24.dp))
@@ -1831,7 +2099,7 @@ fun VoiceSettingsBottomSheet(
                 onClick = { 
                     ttsManager?.speak(previewText.text)
                 },
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth().testTag("btn_play_voice_preview")
             ) {
                 Icon(Icons.Default.PlayArrow, contentDescription = "Play")
                 Spacer(modifier = Modifier.width(8.dp))
@@ -1839,6 +2107,121 @@ fun VoiceSettingsBottomSheet(
             }
             
             Spacer(modifier = Modifier.height(32.dp))
+        }
+    }
+}
+
+@Composable
+fun TailscaleAnimatedSwitch(
+    status: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val isConnecting = status == "Connecting..."
+    val isConnected = status == "Connected"
+    val isTrackingOn = isConnecting || isConnected
+
+    val thumbOffset by animateDpAsState(
+        targetValue = if (isTrackingOn) 24.dp else 0.dp,
+        animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+        label = "thumbOffset"
+    )
+
+    val infiniteTransition = rememberInfiniteTransition(label = "pulse")
+    val pulseColor by infiniteTransition.animateColor(
+        initialValue = StatusConnecting.copy(alpha = 0.4f),
+        targetValue = StatusConnecting,
+        animationSpec = infiniteRepeatable(
+            animation = tween(800, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "pulseColor"
+    )
+
+    val trackColor by animateColorAsState(
+        targetValue = when {
+            isConnected -> StatusConnected
+            isConnecting -> pulseColor
+            else -> TextTertiary
+        },
+        animationSpec = tween(300),
+        label = "trackColor"
+    )
+
+    Box(
+        modifier = modifier
+            .width(52.dp)
+            .height(28.dp)
+            .clip(androidx.compose.foundation.shape.CircleShape)
+            .background(trackColor)
+            .clickable { onClick() }
+            .padding(4.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .size(20.dp)
+                .offset(x = thumbOffset)
+                .clip(androidx.compose.foundation.shape.CircleShape)
+                .background(Color.White)
+        )
+    }
+}
+
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+@Composable
+fun ArtifactsBottomSheet(
+    artifacts: List<ArtifactMessage>,
+    onDismiss: () -> Unit,
+    onArtifactSelected: (ArtifactMessage) -> Unit
+) {
+    androidx.compose.material3.ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        containerColor = DarkSurfaceElevated
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp)
+        ) {
+            Text(
+                "Artifact History",
+                style = MaterialTheme.typography.titleLarge,
+                color = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.padding(bottom = 16.dp)
+            )
+            
+            if (artifacts.isEmpty()) {
+                Text(
+                    "No artifacts received yet in this session.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(bottom = 32.dp)
+                )
+            } else {
+                androidx.compose.foundation.lazy.LazyColumn(modifier = Modifier.fillMaxWidth().padding(bottom = 32.dp)) {
+                    items(artifacts.reversed()) { artifact ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onArtifactSelected(artifact) }
+                                .padding(vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                androidx.compose.material.icons.Icons.Default.List,
+                                contentDescription = "Artifact",
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.padding(end = 12.dp)
+                            )
+                            Text(
+                                text = artifact.title,
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+                    }
+                }
+            }
         }
     }
 }

@@ -1,6 +1,3 @@
-"""
-Client for interacting with the Rover Chrome DevTools Protocol (CDP).
-"""
 from __future__ import annotations
 
 import asyncio
@@ -10,20 +7,26 @@ import subprocess
 import sys
 import urllib.request
 import websockets
+from typing import Any, AsyncGenerator, Callable, Coroutine, Dict, List, Optional, Tuple, cast
 from contextlib import asynccontextmanager
+
+import config
 
 class RoverCDPClient:
     """Encapsulates CDP logic for communicating with the Rover app."""
+    _cdp_port: int | None
     
-    def __init__(self):
+    def __init__(self) -> None:
         self._cdp_port = None
 
     @asynccontextmanager
-    async def _cdp_session(self, ws_url: str, timeout: float = 5.0):
+    async def _cdp_session(
+        self, ws_url: str, timeout: float = config.CDP_SESSION_TIMEOUT_SEC
+    ) -> AsyncGenerator[tuple[Any, Callable[..., Coroutine[Any, Any, dict[str, Any]]]], None]:
         try:
-            async with websockets.connect(ws_url, max_size=50*1024*1024, close_timeout=5) as ws:
+            async with websockets.connect(ws_url, max_size=config.WS_MAX_SIZE_BYTES, close_timeout=config.WS_CLOSE_TIMEOUT_SEC) as ws:
                 msg_id = 1
-                async def send_cdp(method, params=None):
+                async def send_cdp(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
                     nonlocal msg_id
                     payload = {"id": msg_id, "method": method, "params": params or {}}
                     msg_id += 1
@@ -39,7 +42,7 @@ class RoverCDPClient:
                             if resp.get("id") == payload["id"]:
                                 if "error" in resp:
                                     print(f"[CDP] Error in {method}: {resp['error']}", file=sys.stderr)
-                                return resp
+                                return cast(dict[str, Any], resp)
                         except asyncio.TimeoutError:
                             raise asyncio.TimeoutError(f"CDP method {method} timed out")
                 yield ws, send_cdp
@@ -65,7 +68,7 @@ class RoverCDPClient:
             ports = [int(p.strip()) for p in result.stdout.strip().split('\n') if p.strip().isdigit()]
             for port in ports:
                 try:
-                    resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2)
+                    resp = urllib.request.urlopen(f"{config.HTTP_SCHEME}{config.LOOPBACK_IP}:{port}{config.CDP_JSON_VERSION_ENDPOINT}", timeout=int(config.CDP_HTTP_TIMEOUT_SEC))
                     data = json.loads(resp.read())
                     if 'Antigravity' in data.get('User-Agent', ''):
                         self._cdp_port = port
@@ -90,7 +93,7 @@ class RoverCDPClient:
             ports = [int(p.strip()) for p in result.stdout.strip().split('\n') if p.strip().isdigit()]
             for port in ports:
                 try:
-                    resp = urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=2)
+                    resp = urllib.request.urlopen(f"{config.HTTP_SCHEME}{config.LOOPBACK_IP}:{port}{config.CDP_JSON_VERSION_ENDPOINT}", timeout=int(config.CDP_HTTP_TIMEOUT_SEC))
                     data = json.loads(resp.read())
                     if 'Antigravity' in data.get('User-Agent', '') or 'Electron' in data.get('User-Agent', ''):
                         self._cdp_port = port
@@ -113,8 +116,8 @@ class RoverCDPClient:
             return None
     
         try:
-            def fetch():
-                return urllib.request.urlopen(f"http://127.0.0.1:{self._cdp_port}/json", timeout=2).read()
+            def fetch() -> bytes:
+                return cast(bytes, urllib.request.urlopen(f"{config.HTTP_SCHEME}{config.LOOPBACK_IP}:{self._cdp_port}{config.CDP_JSON_ENDPOINT}", timeout=int(config.CDP_HTTP_TIMEOUT_SEC)).read())
             resp_data = await asyncio.to_thread(fetch)
             targets = json.loads(resp_data)
             pages = [t for t in targets if t.get('type') == 'page']
@@ -125,10 +128,10 @@ class RoverCDPClient:
             if conversation_id:
                 for p in pages:
                     if conversation_id in p.get('url', ''):
-                        return p['webSocketDebuggerUrl']
+                        return str(p['webSocketDebuggerUrl'])
     
             # Fall back to first page
-            return pages[0]['webSocketDebuggerUrl']
+            return str(pages[0]['webSocketDebuggerUrl'])
         except Exception as e:
             print(f"[CDP] Error getting page target: {e}", file=sys.stderr)
             # Port may have changed (Rover restarted), rediscover
@@ -137,9 +140,9 @@ class RoverCDPClient:
             if not self._cdp_port:
                 return None
             try:
-                def fetch():
-                    return urllib.request.urlopen(f"http://127.0.0.1:{self._cdp_port}/json", timeout=2).read()
-                resp_data = await asyncio.to_thread(fetch)
+                def fetch_retry() -> bytes:
+                    return cast(bytes, urllib.request.urlopen(f"{config.HTTP_SCHEME}{config.LOOPBACK_IP}:{self._cdp_port}{config.CDP_JSON_ENDPOINT}", timeout=int(config.CDP_HTTP_TIMEOUT_SEC)).read())
+                resp_data = await asyncio.to_thread(fetch_retry)
                 targets = json.loads(resp_data)
                 pages = [t for t in targets if t.get('type') == 'page']
                 if not pages:
@@ -147,8 +150,8 @@ class RoverCDPClient:
                 if conversation_id:
                     for p in pages:
                         if conversation_id in p.get('url', ''):
-                            return p['webSocketDebuggerUrl']
-                return pages[0]['webSocketDebuggerUrl']
+                            return str(p['webSocketDebuggerUrl'])
+                return str(pages[0]['webSocketDebuggerUrl'])
             except Exception as e2:
                 print(f"[CDP] Retry error getting page target: {e2}", file=sys.stderr)
                 return None
@@ -186,17 +189,17 @@ class RoverCDPClient:
     
         try:
             async with self._cdp_session(ws_url, timeout=10.0) as (ws, send_cdp):
-                async def get_current_url():
+                async def get_current_url() -> str:
                     r = await send_cdp("Runtime.evaluate", {
                         "expression": "window.location.href",
                         "returnByValue": True
                     })
                     result = r.get("result", {}).get("result", {})
-                    return result.get("value", "") if isinstance(result, dict) else ""
+                    return str(result.get("value", "")) if isinstance(result, dict) else ""
     
-                async def navigate_to_conversation(base_url):
+                async def navigate_to_conversation(base_url: str) -> None:
                     target_url = f"{base_url}/c/{conversation_id}"
-                    print(f"[CDP] Navigating to conversation {conversation_id[:12]}...", flush=True)
+                    print(f"[CDP] Navigating to conversation {conversation_id[:12] if conversation_id else ''}...", flush=True)
                     await send_cdp("Page.enable")
                     await send_cdp("Page.navigate", {"url": target_url})
                     start_time = asyncio.get_event_loop().time()
@@ -209,12 +212,12 @@ class RoverCDPClient:
                         except asyncio.TimeoutError:
                             continue
     
-                async def is_subagent_view():
+                async def is_subagent_view() -> bool:
                     r = await send_cdp("Runtime.evaluate", {
                         "expression": "document.body.innerText.includes('Cannot send message to subagent')",
                         "returnByValue": True
                     })
-                    return r.get("result", {}).get("result", {}).get("value", False)
+                    return bool(r.get("result", {}).get("result", {}).get("value", False))
     
                 # Step 1: Navigate to the correct conversation if needed
                 if conversation_id and not skip_navigation:
@@ -304,14 +307,57 @@ class RoverCDPClient:
                     "nativeVirtualKeyCode": 13
                 })
 
-                # Fallback: Also try clicking the submit button if Enter failed
+                # Fallback: Try clicking the submit button with native mouse events if Enter failed
                 await asyncio.sleep(0.5)
-                await send_cdp("Runtime.evaluate", {
+                
+                # First, check if there is a "Stop response" button and click it if so
+                res = await send_cdp("Runtime.evaluate", {
                     "expression": """
                         (() => {
                             const ce = document.querySelector('[contenteditable="true"]');
-                            if (!ce) return;
-                            if (!ce.innerText.trim()) return;
+                            if (!ce) return {error: 'no ce'};
+                            let curr = ce;
+                            for (let i = 0; i < 6; i++) {
+                                if (curr.parentElement) curr = curr.parentElement;
+                            }
+                            const btns = Array.from(curr.querySelectorAll('button'));
+                            const stopBtn = btns.find(b => b.getAttribute('aria-label') === 'Stop generating' || b.getAttribute('aria-label') === 'Stop response');
+                            if (stopBtn && !stopBtn.disabled) {
+                                const rect = stopBtn.getBoundingClientRect();
+                                return {x: rect.x + rect.width/2, y: rect.y + rect.height/2};
+                            }
+                            return {error: 'no button'};
+                        })()
+                    """,
+                    "returnByValue": True
+                })
+                val = res.get("result", {}).get("result", {}).get("value", {})
+                if isinstance(val, dict) and "error" not in val and "x" in val and "y" in val:
+                    # Dispatch trusted click to STOP
+                    await send_cdp("Input.dispatchMouseEvent", {
+                        "type": "mousePressed",
+                        "x": val["x"],
+                        "y": val["y"],
+                        "button": "left",
+                        "clickCount": 1
+                    })
+                    await asyncio.sleep(0.05)
+                    await send_cdp("Input.dispatchMouseEvent", {
+                        "type": "mouseReleased",
+                        "x": val["x"],
+                        "y": val["y"],
+                        "button": "left",
+                        "clickCount": 1
+                    })
+                    await asyncio.sleep(0.5)  # Wait for UI to swap to Send button
+
+                # Now look for the Send button
+                res = await send_cdp("Runtime.evaluate", {
+                    "expression": """
+                        (() => {
+                            const ce = document.querySelector('[contenteditable="true"]');
+                            if (!ce) return {error: 'no ce'};
+                            if (!ce.innerText.trim()) return {error: 'empty text'};
                             
                             let curr = ce;
                             for (let i = 0; i < 6; i++) {
@@ -320,14 +366,34 @@ class RoverCDPClient:
                             const btns = Array.from(curr.querySelectorAll('button'));
                             const sendBtn = btns.find(b => b.getAttribute('aria-label') === 'Send message' || b.getAttribute('aria-label') === 'Send Message');
                             if (sendBtn && !sendBtn.disabled) {
-                                sendBtn.click();
-                            } else {
-                                const submit = curr.querySelector('button[type="submit"]');
-                                if (submit && !submit.disabled) submit.click();
+                                const rect = sendBtn.getBoundingClientRect();
+                                return {x: rect.x + rect.width/2, y: rect.y + rect.height/2};
                             }
+                            return {error: 'no button'};
                         })()
-                    """
+                    """,
+                    "returnByValue": True
                 })
+                
+                val = res.get("result", {}).get("result", {}).get("value", {})
+                if isinstance(val, dict) and "error" not in val and "x" in val and "y" in val:
+                    # Dispatch trusted click to SEND
+                    await send_cdp("Input.dispatchMouseEvent", {
+                        "type": "mousePressed",
+                        "x": val["x"],
+                        "y": val["y"],
+                        "button": "left",
+                        "clickCount": 1
+                    })
+                    await asyncio.sleep(0.05)
+                    await send_cdp("Input.dispatchMouseEvent", {
+                        "type": "mouseReleased",
+                        "x": val["x"],
+                        "y": val["y"],
+                        "button": "left",
+                        "clickCount": 1
+                    })
+                    print("[CDP] Fallback: Clicked send button via native mouse event", flush=True)
     
                 return True
         except Exception as e:
@@ -434,7 +500,7 @@ class RoverCDPClient:
 
         try:
             async with self._cdp_session(ws_url) as (ws, send_cdp):
-                async def eval_js(js):
+                async def eval_js(js: str) -> Any:
                     res = await send_cdp("Runtime.evaluate", {"expression": js, "returnByValue": True})
                     return res.get("result", {}).get("result", {}).get("value")
 
@@ -511,15 +577,15 @@ class RoverCDPClient:
         ws_url = await self.get_page_ws(conversation_id)
         if not ws_url:
             print("[CDP] No page target available for create_project", file=sys.stderr, flush=True)
-            return False
+            return None
 
         try:
             async with self._cdp_session(ws_url, timeout=10.0) as (ws, send_cdp):
-                async def eval_js(js):
+                async def eval_js(js: str) -> Any:
                     res = await send_cdp("Runtime.evaluate", {"expression": js, "returnByValue": True})
                     return res.get("result", {}).get("result", {}).get("value")
 
-                async def type_text(text):
+                async def type_text(text: str) -> None:
                     """Type text char-by-char using rawKeyDown+char+keyUp to trigger React."""
                     for char in text:
                         await send_cdp("Input.dispatchKeyEvent", {
@@ -567,7 +633,7 @@ class RoverCDPClient:
                 """)
                 if not result:
                     print("[CDP] Could not find D+ button near Projects", file=sys.stderr, flush=True)
-                    return False
+                    return None
                 await asyncio.sleep(1.0)
 
                 # Step 3: Click "New Project" in the dropdown
@@ -583,7 +649,7 @@ class RoverCDPClient:
                 """)
                 if not result:
                     print("[CDP] Could not find 'New Project' option", file=sys.stderr, flush=True)
-                    return False
+                    return None
                 await asyncio.sleep(1.0)
 
                 # Step 4: Click "Skip" (folder selection step)
@@ -599,7 +665,7 @@ class RoverCDPClient:
                 """)
                 if not result:
                     print("[CDP] Could not find 'Skip' button", file=sys.stderr, flush=True)
-                    return False
+                    return None
                 await asyncio.sleep(1.0)
 
                 # Step 5: Focus the project name input
@@ -615,7 +681,7 @@ class RoverCDPClient:
                 """)
                 if not result:
                     print("[CDP] Could not find project name input", file=sys.stderr, flush=True)
-                    return False
+                    return None
                 await asyncio.sleep(0.2)
 
                 # Step 6: Type the project name
@@ -701,7 +767,8 @@ class RoverCDPClient:
                 }})()
                 """
                 res = await send_cdp("Runtime.evaluate", {"expression": js2, "returnByValue": True})
-                return res.get("result", {}).get("result", {}).get("value", False)
+                val = res.get("result", {}).get("result", {}).get("value", False)
+                return bool(val)
         except Exception as e:
             print(f"[CDP] Error setting model: {e}", file=sys.stderr, flush=True)
             return False
@@ -716,7 +783,7 @@ class RoverCDPClient:
         try:
             async with websockets.connect(ws_url, max_size=50*1024*1024, close_timeout=5) as ws:
                 msg_id = 1
-                async def send_cdp(method, params=None):
+                async def send_cdp(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
                     nonlocal msg_id
                     payload = {"id": msg_id, "method": method, "params": params or {}}
                     msg_id += 1
@@ -724,7 +791,7 @@ class RoverCDPClient:
                     while True:
                         resp = json.loads(await ws.recv())
                         if resp.get("id") == payload["id"]:
-                            return resp
+                            return cast(dict[str, Any], resp)
                 
                 # We need to construct the JavaScript code to inject
                 # Using f-strings to inject our parameters into the JS snippet
@@ -802,7 +869,7 @@ class RoverCDPClient:
             print(f"[CDP] Error updating project: {e}", file=sys.stderr, flush=True)
             return False
 
-    async def monitor_queue(self, callback, conversation_id: str | None = None) -> None:
+    async def monitor_queue(self, callback: Callable[[dict[str, Any]], Any], conversation_id: str | None = None) -> None:
         """Continuously monitor the desktop DOM for queue changes and push to callback."""
         ws_url = await self.get_page_ws(conversation_id)
         if not ws_url:
@@ -811,7 +878,7 @@ class RoverCDPClient:
         try:
             async with websockets.connect(ws_url, max_size=50*1024*1024) as ws:
                 msg_id = 1
-                async def send_cdp(method, params=None):
+                async def send_cdp(method: str, params: dict[str, Any] | None = None) -> None:
                     nonlocal msg_id
                     payload = {"id": msg_id, "method": method, "params": params or {}}
                     msg_id += 1
@@ -930,3 +997,4 @@ class RoverCDPClient:
             print(f"[CDP] manage_queued_message error: {e}", file=sys.stderr)
             self._cdp_port = None
             return False
+

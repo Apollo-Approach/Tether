@@ -13,6 +13,7 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
@@ -54,6 +55,10 @@ dependencies {
 
   // Media (MediaStyle notifications)
   implementation("androidx.media:media:1.7.0")
+
+  // Location Services
+  implementation("com.google.android.gms:play-services-location:21.3.0")
+  implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.8.1")
 
   val composeBom = platform(libs.androidx.compose.bom)
   implementation(composeBom)

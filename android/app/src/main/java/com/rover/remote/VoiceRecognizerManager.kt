@@ -2,11 +2,11 @@ package com.rover.remote
 
 import android.content.Context
 import android.content.Intent
-import android.media.AudioManager
-import android.media.ToneGenerator
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -14,156 +14,127 @@ import android.util.Log
 
 class VoiceRecognizerManager(
     private val context: Context,
+    private val btRoutingManager: BluetoothVoiceRoutingManager,
     private val onResult: (String) -> Unit,
-    private val onError: (String) -> Unit
-) {
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private val toneGenerator = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100)
-    
+    private val onStateChange: (Boolean) -> Unit
+) : RecognitionListener {
+
     private var speechRecognizer: SpeechRecognizer? = null
-    private var isListening = false
-    private var isForceFinishing = false
-    private var accumulatedText = ""
-    private var lastSilenceCheckTime = System.currentTimeMillis()
-    
-    private val silenceRunnable = object : Runnable {
-        override fun run() {
-            if (!isListening || isForceFinishing) return
-            val now = System.currentTimeMillis()
-            if (now - lastSilenceCheckTime > 3000) {
-                Log.d("VoiceManager", "3 seconds of absolute silence detected. Ending transmission.")
-                triggerStop()
-            } else {
-                mainHandler.postDelayed(this, 500)
-            }
-        }
-    }
+    var isListening = false
+        private set
 
     init {
         initRecognizer()
     }
 
     private fun initRecognizer() {
-        if (!SpeechRecognizer.isRecognitionAvailable(context)) {
-            Log.e("VoiceManager", "Speech recognition not available on this device")
-            onError("Speech recognition not available")
-            return
+        if (SpeechRecognizer.isRecognitionAvailable(context)) {
+            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context)
+            speechRecognizer?.setRecognitionListener(this)
+        } else {
+            Log.e("VoiceRecognizer", "Speech recognition is not available on this device.")
         }
-
-        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context).apply {
-            setRecognitionListener(object : RecognitionListener {
-                override fun onReadyForSpeech(params: Bundle?) {}
-                override fun onBeginningOfSpeech() {}
-                override fun onRmsChanged(rmsdB: Float) {}
-                override fun onBufferReceived(buffer: ByteArray?) {}
-                override fun onEndOfSpeech() {}
-
-                override fun onError(error: Int) {
-                    if (!isListening) return
-                    Log.e("VoiceManager", "SpeechRecognizer error: $error")
-                    
-                    if (isForceFinishing) {
-                        sendAndCleanUp()
-                        return
-                    }
-                    
-                    if (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT || error == SpeechRecognizer.ERROR_CLIENT) {
-                        Log.d("VoiceManager", "Google timed out without hearing anything. Restarting microphone silently...")
-                        startGoogleEngine()
-                    } else if (error != SpeechRecognizer.ERROR_RECOGNIZER_BUSY) {
-                        onError("Google ASR Error: $error")
-                        sendAndCleanUp()
-                    }
-                }
-
-                override fun onResults(results: Bundle?) {
-                    if (!isListening) return
-                    val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    if (matches != null && matches.isNotEmpty()) {
-                        val text = matches[0].trim()
-                        if (text.isNotEmpty()) {
-                            accumulatedText = if (accumulatedText.isEmpty()) text else "$accumulatedText $text"
-                        }
-                    }
-                    
-                    if (isForceFinishing) {
-                        sendAndCleanUp()
-                    } else {
-                        Log.d("VoiceManager", "Google cut off early. Restarting microphone silently. Current text: $accumulatedText")
-                        startGoogleEngine()
-                    }
-                }
-
-                override fun onPartialResults(partialResults: Bundle?) {
-                    if (!isListening) return
-                    // We heard a word! Reset the silence timer
-                    lastSilenceCheckTime = System.currentTimeMillis()
-                }
-
-                override fun onEvent(eventType: Int, params: Bundle?) {}
-            })
-        }
-    }
-
-    private fun startGoogleEngine() {
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-        }
-        speechRecognizer?.startListening(intent)
     }
 
     fun startListening() {
         if (isListening) return
         
-        accumulatedText = ""
+        // 1. Enable Bluetooth audio routing before we start listening
+        btRoutingManager.enableBluetoothMicRouting()
+        
+        // 2. Mark as listening immediately to prevent double-taps triggering multiple instances
         isListening = true
-        isForceFinishing = false
-        lastSilenceCheckTime = System.currentTimeMillis()
+        onStateChange(true)
         
-        mainHandler.postDelayed(silenceRunnable, 500)
-        toneGenerator.startTone(ToneGenerator.TONE_PROP_PROMPT, 150)
-        startGoogleEngine()
-    }
-    
-    private fun triggerStop() {
-        if (!isListening || isForceFinishing) return
-        isForceFinishing = true
-        mainHandler.removeCallbacks(silenceRunnable)
-        try {
-            speechRecognizer?.stopListening()
-        } catch (e: Exception) {
-            Log.e("VoiceManager", "Error stopping recognizer", e)
-            sendAndCleanUp()
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true) // Force on-device for speed
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+            // Enforce a strict 3-second silence timeout (fixes car Bluetooth road noise VAD hangs)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 3000L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 3000L)
         }
-    }
-
-    private fun sendAndCleanUp() {
-        isListening = false
-        isForceFinishing = false
-        mainHandler.removeCallbacks(silenceRunnable)
         
-        val finalText = accumulatedText.trim()
-        if (finalText.isNotEmpty()) {
-            toneGenerator.startTone(ToneGenerator.TONE_PROP_ACK, 100)
-            onResult(finalText)
-        } else {
-            // Signal empty string via onError to release audio focus safely
-            onError("Empty result")
-        }
+        // Delay 1 second to allow the Bluetooth SCO link to establish before capturing audio
+        Handler(Looper.getMainLooper()).postDelayed({
+            try {
+                if (isListening) { // Ensure they haven't stopped it already
+                    speechRecognizer?.startListening(intent)
+                }
+            } catch (e: Exception) {
+                Log.e("VoiceRecognizer", "Failed to start listening", e)
+                cleanupRouting()
+            }
+        }, 1000)
     }
 
     fun stopListening() {
         if (!isListening) return
-        triggerStop()
+        speechRecognizer?.stopListening()
+        // Wait for onResults or onError to clean up routing
     }
 
     fun destroy() {
-        isListening = false
-        isForceFinishing = false
-        mainHandler.removeCallbacks(silenceRunnable)
         speechRecognizer?.destroy()
         speechRecognizer = null
-        toneGenerator.release()
+        cleanupRouting()
     }
+
+    private fun cleanupRouting() {
+        isListening = false
+        onStateChange(false)
+        
+        // Delay restoring the audio mode by 1.5 seconds.
+        // This prevents a native SIGABRT crash in libgoogle_speech_jni.so caused by
+        // yanking the Bluetooth SCO route away while the AudioRecord is still tearing down.
+        Handler(Looper.getMainLooper()).postDelayed({
+            btRoutingManager.disableBluetoothMicRouting()
+        }, 1500)
+    }
+
+    // --- RecognitionListener Callbacks ---
+
+    override fun onReadyForSpeech(params: Bundle?) {
+        Log.d("VoiceRecognizer", "Ready for speech")
+        try {
+            val toneGen = ToneGenerator(AudioManager.STREAM_VOICE_CALL, 100)
+            toneGen.startTone(ToneGenerator.TONE_PROP_PROMPT, 150)
+            Handler(Looper.getMainLooper()).postDelayed({
+                toneGen.release()
+            }, 200)
+        } catch (e: Exception) {
+            Log.e("VoiceRecognizer", "Failed to play chime", e)
+        }
+    }
+
+    override fun onBeginningOfSpeech() {
+        Log.d("VoiceRecognizer", "Beginning of speech")
+    }
+
+    override fun onRmsChanged(rmsdB: Float) {}
+
+    override fun onBufferReceived(buffer: ByteArray?) {}
+
+    override fun onEndOfSpeech() {
+        Log.d("VoiceRecognizer", "End of speech")
+    }
+
+    override fun onError(error: Int) {
+        Log.e("VoiceRecognizer", "Speech recognition error: $error")
+        cleanupRouting()
+    }
+
+    override fun onResults(results: Bundle?) {
+        val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+        if (!matches.isNullOrEmpty()) {
+            val text = matches[0]
+            Log.d("VoiceRecognizer", "Recognized: $text")
+            onResult(text)
+        }
+        cleanupRouting()
+    }
+
+    override fun onPartialResults(partialResults: Bundle?) {}
+
+    override fun onEvent(eventType: Int, params: Bundle?) {}
 }
