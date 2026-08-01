@@ -89,7 +89,7 @@ import okhttp3.WebSocketListener
 import okhttp3.Response
 import org.json.JSONObject
 
-data class ChatMessage(val role: String, val message: String)
+data class ChatMessage(val role: String, val message: String, val imageBase64: String? = null)
 data class ArtifactMessage(val title: String, val content: String)
 data class ApprovalRequest(val title: String, val options: List<String>)
 
@@ -242,6 +242,37 @@ fun RemoteControlScreen() {
 
     var showInitialNetworkPrompt by remember { mutableStateOf(state.trustedNetworks.isEmpty()) }
     var hasPromptedForNetwork by remember { mutableStateOf(false) }
+
+    // Reconnection overlay state
+    var showReconnectOverlay by remember { mutableStateOf(false) }
+    var reconnectMessage by remember { mutableStateOf("Reconnecting...") }
+    
+    // Detect app returning to foreground
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                val currentStatus = ConnectionRepository.state.value.connectionStatus
+                if (currentStatus != "Connected") {
+                    reconnectMessage = "Reconnecting..."
+                    showReconnectOverlay = true
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+    
+    // Watch for connection restored while overlay is showing
+    LaunchedEffect(connectionStatus, showReconnectOverlay) {
+        if (showReconnectOverlay && connectionStatus == "Connected") {
+            reconnectMessage = "Connected ✓"
+            kotlinx.coroutines.delay(1500)
+            showReconnectOverlay = false
+        }
+    }
     
     val initialNetworkPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -637,6 +668,52 @@ fun RemoteControlScreen() {
                     label = "wireframeAlpha"
                 )
                 AnimatedWireframeBackground(modifier = Modifier.fillMaxSize().alpha(wireframeAlpha))
+
+                // Reconnection overlay
+                AnimatedVisibility(
+                    visible = showReconnectOverlay,
+                    enter = fadeIn(animationSpec = tween(300)),
+                    exit = fadeOut(animationSpec = tween(500))
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(Color.Black.copy(alpha = 0.6f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Surface(
+                            shape = RoundedCornerShape(16.dp),
+                            color = MaterialTheme.colorScheme.surface,
+                            tonalElevation = 8.dp,
+                            modifier = Modifier.padding(48.dp)
+                        ) {
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                modifier = Modifier.padding(32.dp)
+                            ) {
+                                if (reconnectMessage == "Connected ✓") {
+                                    Icon(
+                                        Icons.Default.Check,
+                                        contentDescription = "Connected",
+                                        tint = StatusConnected,
+                                        modifier = Modifier.size(40.dp)
+                                    )
+                                } else {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(40.dp),
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                                Spacer(modifier = Modifier.height(16.dp))
+                                Text(
+                                    text = reconnectMessage,
+                                    style = MaterialTheme.typography.titleMedium,
+                                    color = if (reconnectMessage == "Connected ✓") StatusConnected else MaterialTheme.colorScheme.onSurface
+                                )
+                            }
+                        }
+                    }
+                }
                 
                 if (showVoiceSettings) {
                     VoiceSettingsBottomSheet(onDismiss = { showVoiceSettings = false })
@@ -899,12 +976,33 @@ fun RemoteControlScreen() {
                                             modifier = Modifier.fillMaxWidth(0.85f)
                                         ) {
                                             if (isUser) {
-                                                Text(
-                                                    text = msg.message,
-                                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-                                                    style = MaterialTheme.typography.bodyMedium,
-                                                    color = MaterialTheme.colorScheme.onPrimaryContainer
-                                                )
+                                                if (msg.imageBase64 != null) {
+                                                    var bitmap: android.graphics.Bitmap? = null
+                                                    try {
+                                                        val imageBytes = android.util.Base64.decode(msg.imageBase64, android.util.Base64.DEFAULT)
+                                                        bitmap = android.graphics.BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+                                                    } catch (e: Exception) {
+                                                        // Fallback handled by null check below
+                                                    }
+                                                    
+                                                    if (bitmap != null) {
+                                                        androidx.compose.foundation.Image(
+                                                            bitmap = bitmap.asImageBitmap(),
+                                                            contentDescription = "Sent Image",
+                                                            modifier = Modifier.padding(8.dp).height(120.dp).clip(RoundedCornerShape(8.dp)),
+                                                            contentScale = androidx.compose.ui.layout.ContentScale.Fit
+                                                        )
+                                                    } else {
+                                                        Text("Image error", modifier = Modifier.padding(14.dp))
+                                                    }
+                                                } else {
+                                                    Text(
+                                                        text = msg.message,
+                                                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                                                        style = MaterialTheme.typography.bodyMedium,
+                                                        color = MaterialTheme.colorScheme.onPrimaryContainer
+                                                    )
+                                                }
                                             } else {
                                                 MarkdownText(
                                                     markdown = msg.message,
@@ -1521,6 +1619,7 @@ fun RemoteControlScreen() {
                                             put("data", selectedImageBase64)
                                         }
                                         ConnectionRepository.webSocketManager?.send(imageJson.toString())
+                                        ConnectionRepository.addChatMessage(ChatMessage("user", "", imageBase64 = selectedImageBase64))
                                         selectedImageBitmap = null
                                         selectedImageBase64 = null
                                     }

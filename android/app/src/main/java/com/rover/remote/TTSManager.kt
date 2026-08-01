@@ -20,7 +20,7 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 
-private data class AudioTask(val index: Int, val samples: FloatArray, val sampleRate: Int)
+private data class AudioTask(val samples: ShortArray, val sampleRate: Int)
 
 class TTSManager(private val context: Context, private val onQueueFinished: () -> Unit) {
 
@@ -107,6 +107,11 @@ class TTSManager(private val context: Context, private val onQueueFinished: () -
         }
     }
 
+    companion object {
+        private const val MAX_CHUNK_CHARS = 200
+        private const val FORCE_BREAK_CHARS = 250
+    }
+
     fun speak(text: String, flush: Boolean = false) {
         if (!isInitialized) return
         
@@ -126,24 +131,91 @@ class TTSManager(private val context: Context, private val onQueueFinished: () -
         val sentences = cleanText.split(Regex("(?<=[.!?])\\s+|\\n+"))
             .map { it.trim() }
             .filter { it.isNotEmpty() }
+        
+        // 6. Sub-chunk long sentences so the producer stays ahead of the consumer
+        val chunks = sentences.flatMap { splitIntoChunks(it) }
             
         if (flush) stop()
         
-        if (sentences.isEmpty()) {
+        if (chunks.isEmpty()) {
             if (flush) onQueueFinished()
             return
         }
         
         isPaused = false
-        itemsInFlight.addAndGet(sentences.size)
+        itemsInFlight.addAndGet(chunks.size)
         
-        for (s in sentences) {
-            sentenceChannel.trySend(s)
+        for (chunk in chunks) {
+            sentenceChannel.trySend(chunk)
         }
         
         if (producerJob?.isActive != true || consumerJob?.isActive != true) {
             startPipelines()
         }
+    }
+
+    /**
+     * Splits text longer than MAX_CHUNK_CHARS at natural break points
+     * (commas, semicolons, colons, " and ", " or ", dashes).
+     * Force-breaks at FORCE_BREAK_CHARS on the last space if no natural break found.
+     */
+    private fun splitIntoChunks(text: String): List<String> {
+        if (text.length <= MAX_CHUNK_CHARS) return listOf(text)
+        
+        val chunks = mutableListOf<String>()
+        var remaining = text
+        
+        while (remaining.length > MAX_CHUNK_CHARS) {
+            // Look for a natural break point within the target window
+            var breakIdx = -1
+            val searchEnd = minOf(remaining.length, FORCE_BREAK_CHARS)
+            
+            // Prefer breaking at comma/semicolon/colon followed by space
+            for (i in searchEnd - 1 downTo MAX_CHUNK_CHARS / 2) {
+                val c = remaining[i]
+                if ((c == ',' || c == ';' || c == ':') && i + 1 < remaining.length && remaining[i + 1] == ' ') {
+                    breakIdx = i + 1  // Include the punctuation, break after space
+                    break
+                }
+            }
+            
+            // Try " and " or " or " as break points
+            if (breakIdx == -1) {
+                val andIdx = remaining.lastIndexOf(" and ", searchEnd)
+                val orIdx = remaining.lastIndexOf(" or ", searchEnd)
+                val conjIdx = maxOf(andIdx, orIdx)
+                if (conjIdx >= MAX_CHUNK_CHARS / 2) {
+                    breakIdx = conjIdx
+                }
+            }
+            
+            // Try an em-dash or hyphen surrounded by spaces
+            if (breakIdx == -1) {
+                val dashIdx = remaining.lastIndexOf(" — ", searchEnd)
+                val hyphenIdx = remaining.lastIndexOf(" - ", searchEnd)
+                val dIdx = maxOf(dashIdx, hyphenIdx)
+                if (dIdx >= MAX_CHUNK_CHARS / 2) {
+                    breakIdx = dIdx
+                }
+            }
+            
+            // Force-break at last space within window
+            if (breakIdx == -1) {
+                breakIdx = remaining.lastIndexOf(' ', searchEnd - 1)
+                if (breakIdx < MAX_CHUNK_CHARS / 2) {
+                    breakIdx = searchEnd  // No space found, hard break
+                }
+            }
+            
+            chunks.add(remaining.substring(0, breakIdx).trim())
+            remaining = remaining.substring(breakIdx).trim()
+        }
+        
+        if (remaining.isNotEmpty()) {
+            chunks.add(remaining)
+        }
+        
+        return chunks.filter { it.isNotEmpty() }
     }
     
     fun stop() {
@@ -157,19 +229,26 @@ class TTSManager(private val context: Context, private val onQueueFinished: () -
         audioTrack?.flush()
         
         sentenceChannel = Channel(Channel.UNLIMITED)
-        audioChannel = Channel(capacity = 5)
+        audioChannel = Channel(capacity = 8)
     }
 
     private fun startPipelines() {
         producerJob = scope.launch {
             for (sentence in sentenceChannel) {
                 if (!isActive) break
-                Log.d("TTSManager", "Generating audio for: $sentence")
+                Log.d("TTSManager", "Generating audio for (${sentence.length} chars): ${sentence.take(60)}...")
                 try {
                     val ttsInstance = tts ?: break
                     val audio = ttsInstance.generate(sentence, sid = currentSid, speed = 1.0f)
                     if (isActive) {
-                        audioChannel.send(AudioTask(0, audio.samples, audio.sampleRate))
+                        // Convert float→short on the producer thread so the consumer
+                        // can write to AudioTrack immediately without CPU work
+                        val shortSamples = ShortArray(audio.samples.size)
+                        for (i in audio.samples.indices) {
+                            val f = audio.samples[i].coerceIn(-1.0f, 1.0f)
+                            shortSamples[i] = (f * 32767.0f).toInt().toShort()
+                        }
+                        audioChannel.send(AudioTask(shortSamples, audio.sampleRate))
                     } else {
                         checkQueueFinished()
                     }
@@ -181,12 +260,15 @@ class TTSManager(private val context: Context, private val onQueueFinished: () -
         }
         
         consumerJob = scope.launch {
+            var trackPlaying = false
+            
             for (task in audioChannel) {
                 if (!isActive) break
                 
                 val sampleRate = task.sampleRate
                 if (audioTrack == null || audioTrack?.sampleRate != sampleRate) {
                     audioTrack?.release()
+                    trackPlaying = false
                     audioTrack = AudioTrack.Builder()
                         .setAudioAttributes(AudioAttributes.Builder()
                             .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
@@ -198,7 +280,7 @@ class TTSManager(private val context: Context, private val onQueueFinished: () -
                             .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                             .build())
                         .setTransferMode(AudioTrack.MODE_STREAM)
-                        .setBufferSizeInBytes(AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT) * 2)
+                        .setBufferSizeInBytes(AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT) * 4)
                         .build()
                 }
 
@@ -210,13 +292,12 @@ class TTSManager(private val context: Context, private val onQueueFinished: () -
                 if (!isActive) break
                 
                 try {
-                    track.play()
-                    val shortSamples = ShortArray(task.samples.size)
-                    for (i in task.samples.indices) {
-                        val f = task.samples[i].coerceIn(-1.0f, 1.0f)
-                        shortSamples[i] = (f * 32767.0f).toInt().toShort()
+                    // Only call play() once — subsequent writes stream seamlessly
+                    if (!trackPlaying) {
+                        track.play()
+                        trackPlaying = true
                     }
-                    track.write(shortSamples, 0, shortSamples.size, AudioTrack.WRITE_BLOCKING)
+                    track.write(task.samples, 0, task.samples.size, AudioTrack.WRITE_BLOCKING)
                 } catch (e: Exception) {
                     Log.e("TTSManager", "Error playing track: ${e.message}")
                 }
